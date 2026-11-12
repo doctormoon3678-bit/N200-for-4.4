@@ -1,0 +1,15 @@
+# The original APK is proprietary and 16 MB. Keep it out of the repo.
+apk/*.apk
+
+# Build and repack outputs
+out/
+stub/libs/
+stub/obj/
+stub/out/
+stub/.got.txt
+
+# Signing keys never belong in version control
+keys/
+
+__pycache__/
+*.pyc
