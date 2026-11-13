@@ -15,6 +15,12 @@ LOCAL_CPPFLAGS  := -O2 -fno-exceptions -fno-rtti -fvisibility=default -fno-lto -
 # liblog only (NDK-stable). Used by the optional -DSTUB_TRACE=1 build.
 LOCAL_LDLIBS    := -llog
 
+# Export the 16 stubbed symbols and nothing else. See stub.map for why this
+# matters: without it the statically linked libunwind/libgcc gets re-exported
+# and can capture the other libraries' unwinder lookups.
+LOCAL_LDFLAGS   := -Wl,--version-script=$(LOCAL_PATH)/stub.map \
+                   -Wl,--exclude-libs,ALL
+
 # Trace build: STUB_TRACE=1 ./build.sh
 ifeq ($(STUB_TRACE),1)
   LOCAL_CPPFLAGS += -DSTUB_TRACE=1

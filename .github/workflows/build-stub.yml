@@ -119,8 +119,11 @@ jobs:
             echo "-- exported --"
             "$READELF" -sW --dyn-syms "$so" \
               | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print "   "$8}' | sort -u
+            # The NDK r21e llvm-readelf has no -A; GNU binutils, preinstalled on
+            # the runner, does. Compare against the app's own libraries, which
+            # are Tag_CPU_arch v7 / VFPv3 / NEONv1.
             echo "-- ARM build attributes --"
-            "$READELF" -A "$so" | grep -E 'Tag_CPU_arch|Tag_FP_arch|Tag_ABI_VFP' || true
+            readelf -A "$so" | grep -E 'Tag_CPU_arch|Tag_FP_arch|Tag_ABI_VFP' || true
           done
 
       - uses: actions/upload-artifact@v4

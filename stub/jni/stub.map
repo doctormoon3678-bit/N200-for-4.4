@@ -1,0 +1,30 @@
+/*
+ * Linker version script: export the stubbed classes and nothing else.
+ *
+ * Without this, the NDK's armeabi-v7a link statically pulls in libunwind.a and
+ * libgcc, and -fvisibility=default re-exports all of it --
+ * _Unwind_RaiseException, _Unwind_Resume, __aeabi_unwind_cpp_pr0/1/2,
+ * __gnu_unwind_frame, unw_step and friends end up in this library's .dynsym.
+ *
+ * That is not cosmetic. The KitKat dynamic linker resolves a symbol by
+ * searching the requesting library's own DT_NEEDED list first, and
+ * libHNcommonlib.so, libGUI_WIDGET.so and libNV_GUI.so all list
+ * libstagefright_dmb.so. So those libraries would bind their unwinder entry
+ * points to the copy statically linked into this stub instead of the one in
+ * libgnustl_shared.so, which is the C++ runtime the rest of the app was built
+ * against. Mixing unwinders breaks exception handling in the navigation engine.
+ *
+ * The stub itself is built -fno-exceptions and needs no unwinder of its own, so
+ * localizing all of it costs nothing. -Wl,--exclude-libs,ALL in Android.mk
+ * keeps static-archive symbols out as well.
+ *
+ * Note: version scripts take C-style comments only. A // comment is a syntax
+ * error, and ld reports it as "ignoring invalid character".
+ */
+{
+  global:
+    _ZN7android14DMBPlayerClass*;
+    _ZN7android14TTSPlayerClass*;
+  local:
+    *;
+};

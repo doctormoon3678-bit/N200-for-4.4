@@ -28,7 +28,10 @@ TMP="$(mktemp -d -t n200mangle.XXXXXX)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "==> host-compiling the stub with $CXX (mangling only; the object is thrown away)"
+# Same version script as the real build, so the exported set checked here is
+# the exported set the ARM build will produce.
 "$CXX" -shared -fPIC -O2 -fno-exceptions -fno-rtti -fvisibility=default \
+    -Wl,--version-script="$REPO/stub/jni/stub.map" -Wl,--exclude-libs,ALL \
     -o "$TMP/mangle.so" "$SRC"
 
 "$READELF" -sW --dyn-syms "$TMP/mangle.so" \
@@ -52,11 +55,15 @@ fi
 echo "    ok: all $(wc -l < "$TMP/want.txt") required symbols present"
 
 # GCC emits C2 (base-object constructor) alongside C1 for a class with no
-# virtual bases. Those aliases are harmless. Anything else extra is suspicious.
-UNEXPECTED="$(echo "$EXTRA" | grep -v 'C2E' || true)"
+# virtual bases. Those aliases are harmless. Anything else is a failure: see the
+# comment in stub/jni/stub.map for why a stray export is dangerous here.
+UNEXPECTED="$(echo "$EXTRA" | grep -vE 'C2E|^(__bss_start|_edata|_end)$|^$' || true)"
 if [ -n "$UNEXPECTED" ]; then
-    echo "warning: the stub also exports symbols nothing asked for:" >&2
+    echo "FAIL: the stub exports symbols nothing asked for:" >&2
     echo "$UNEXPECTED" | sed 's/^/    /' >&2
+    echo >&2
+    echo "Check that jni/stub.map still localizes everything else." >&2
+    exit 1
 fi
-[ -n "$EXTRA" ] && echo "    (plus harmless C2 constructor aliases)"
+echo "    ok: no unexpected exports"
 exit 0

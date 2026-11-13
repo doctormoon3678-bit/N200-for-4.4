@@ -80,6 +80,24 @@ if [ -n "$MISSING" ]; then
 fi
 echo "    ok: all 16 required symbols exported"
 
+# And nothing else. An armeabi-v7a link statically pulls in libunwind/libgcc,
+# and re-exporting those would let the app's other libraries bind their unwinder
+# to this stub instead of to libgnustl_shared.so. jni/stub.map prevents it; this
+# is the check that it actually took effect.
+EXTRA="$(comm -13 <(sort -u expected_symbols.txt) "$HERE/.got.txt" \
+        | grep -vE 'C2E|^(__bss_start|_edata|_end)$' || true)"
+if [ -n "$EXTRA" ]; then
+    echo "FAIL: the stub exports symbols nothing asked for:" >&2
+    echo "$EXTRA" | sed 's/^/        /' >&2
+    echo >&2
+    echo "      Mixing these with the app's own C++ runtime is a real hazard --" >&2
+    echo "      see the comment in jni/stub.map. Check that the version script" >&2
+    echo "      and -Wl,--exclude-libs,ALL are still in LOCAL_LDFLAGS." >&2
+    rm -f "$HERE/.got.txt"
+    exit 1
+fi
+echo "    ok: no unexpected exports"
+
 # SONAME must stay libstagefright_dmb.so for the DT_NEEDED entries to resolve.
 SONAME="$("$READELF" -d "$SO" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
 if [ "$SONAME" != "libstagefright_dmb.so" ]; then
