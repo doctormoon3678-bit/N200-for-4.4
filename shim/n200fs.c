@@ -1291,7 +1291,10 @@ static int  (*r_usleep)(u32);
 static long (*r_time)(void *);
 static int  (*r_pthread_create)(void *, const void *, void *(*)(void *), void *);
 
-static int g_gps = 1;                 /* inject unless told otherwise */
+#ifndef N200FS_GPS_DEFAULT
+#define N200FS_GPS_DEFAULT 1
+#endif
+static int g_gps = N200FS_GPS_DEFAULT;                 /* inject unless told otherwise */
 static int g_lat = 37566500;          /* microdegrees; Seoul City Hall */
 static int g_lon = 126978000;
 

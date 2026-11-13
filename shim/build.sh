@@ -9,6 +9,10 @@
 #
 # Usage:
 #   shim/build.sh [--cc clang] [--out shim/out/libn200fs.so]
+#
+# GPS_DEFAULT=0 shim/build.sh
+#   build with the synthetic GPS feed off by default -- the right build for a
+#   car with a real receiver. n200fs.conf's gps= line still overrides it.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -63,6 +67,7 @@ cat > "$WORK/export.map" <<'EOF'
 EOF
 
 "$CC" --target="$TARGET" -fPIC -Os -std=c99 \
+      -DN200FS_GPS_DEFAULT="${GPS_DEFAULT:-1}" \
       -ffreestanding -fno-builtin -fno-stack-protector \
       -Wall -Wextra -Wno-unused-parameter \
       -c "$HERE/n200fs.c" -o "$WORK/n200fs.o"
