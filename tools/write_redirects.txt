@@ -14,8 +14,14 @@
 #   #02 fprintf+12
 #   #03 libNV_CNS2K.so (startMain(_JNIEnv*, _jobject*)+1496)
 #
-# /data/data/com.npnd.n200/ is owned by the app's own uid, so writes there
-# always work with no root and no permission changes.
+# /sdcard is PRIMARY storage, and the KitKat restriction applies only to
+# SECONDARY storage -- the card. WRITE_EXTERNAL_STORAGE, which this app already
+# declares, covers primary storage fully, so writes there work with no root and
+# no permission changes.
+#
+# Primary storage is also reachable from any file manager on the phone, which
+# is why it is used here in preference to /data/data/<package>: preparing a
+# directory under /data/data would need `adb shell run-as` or root.
 #
 # Keeping the reads on the card is the point: the map database
 # (Navkingdom/Common/DB_MAP/NF60_NPND_Korea.sti and friends) is gigabytes and
@@ -45,25 +51,25 @@
 # concatenated with "/" and a "/..." suffix); classes.dex spells the same paths
 # with one. Both forms need the rule, or the Java and native halves would end up
 # writing to different places.
-/mnt/extSdCard///Navkingdom/Persistence=/data/data/com.npnd.n200/Persistence
-/mnt/extSdCard/Navkingdom/Persistence=/data/data/com.npnd.n200/Persistence
-/mnt/extSdCard///Persistence=/data/data/com.npnd.n200/P
+/mnt/extSdCard///Navkingdom/Persistence=/sdcard/Navkingdom/Persistence
+/mnt/extSdCard/Navkingdom/Persistence=/sdcard/Navkingdom/Persistence
+/mnt/extSdCard///Persistence=/sdcard/Persistence
 
 # -- the file that actually crashes (fprintf on a NULL FILE*) ---------------
-/mnt/extSdCard///Navkingdom/LoggerServerPID=/data/data/com.npnd.n200/LoggerServerPID
+/mnt/extSdCard///Navkingdom/LoggerServerPID=/sdcard/Navkingdom/LoggerServerPID
 
 # -- other unmistakably runtime-generated files -----------------------------
-/mnt/extSdCard///Navkingdom/log_rawdata_start_flag_true=/data/data/com.npnd.n200/log_rawdata_start_flag_true
-/mnt/extSdCard///Navkingdom/log_start_flag_true=/data/data/com.npnd.n200/log_start_flag_true
-/mnt/extSdCard///Navkingdom/UpdateCheck.dat=/data/data/com.npnd.n200/UpdateCheck.dat
-/mnt/extSdCard///Navkingdom/tempBTUpdate=/data/data/com.npnd.n200/tempBTUpdate
-/mnt/extSdCard///Navkingdom/userDist.txt=/data/data/com.npnd.n200/userDist.txt
-/mnt/extSdCard///Navkingdom/npnd_nmea_=/data/data/com.npnd.n200/npnd_nmea_
-/mnt/extSdCard///Navkingdom/meminfo.txt=/data/data/com.npnd.n200/meminfo.txt
-/mnt/extSdCard///Navkingdom/BTDL_TEST=/data/data/com.npnd.n200/BTDL_TEST
-/mnt/extSdCard///Navkingdom/test.txt=/data/data/com.npnd.n200/test.txt
-/mnt/extSdCard///Navkingdom/log_=/data/data/com.npnd.n200/log_
-/mnt/extSdCard///JNI_Exception.log=/data/data/com.npnd.n200/jni.log
-/mnt/extSdCard///BackupResult.txt=/data/data/com.npnd.n200/bk.txt
-/mnt/extSdCard///tombstones/=/data/data/com.npnd.n200/tb/
-/mnt/extSdCard///SnapShot=/data/data/com.npnd.n200/
+/mnt/extSdCard///Navkingdom/log_rawdata_start_flag_true=/sdcard/Navkingdom/log_rawdata_start_flag_true
+/mnt/extSdCard///Navkingdom/log_start_flag_true=/sdcard/Navkingdom/log_start_flag_true
+/mnt/extSdCard///Navkingdom/UpdateCheck.dat=/sdcard/Navkingdom/UpdateCheck.dat
+/mnt/extSdCard///Navkingdom/tempBTUpdate=/sdcard/Navkingdom/tempBTUpdate
+/mnt/extSdCard///Navkingdom/userDist.txt=/sdcard/Navkingdom/userDist.txt
+/mnt/extSdCard///Navkingdom/npnd_nmea_=/sdcard/Navkingdom/npnd_nmea_
+/mnt/extSdCard///Navkingdom/meminfo.txt=/sdcard/Navkingdom/meminfo.txt
+/mnt/extSdCard///Navkingdom/BTDL_TEST=/sdcard/Navkingdom/BTDL_TEST
+/mnt/extSdCard///Navkingdom/test.txt=/sdcard/Navkingdom/test.txt
+/mnt/extSdCard///Navkingdom/log_=/sdcard/Navkingdom/log_
+/mnt/extSdCard///JNI_Exception.log=/sdcard/Navkingdom/jni.log
+/mnt/extSdCard///BackupResult.txt=/sdcard/Navkingdom/bk.txt
+/mnt/extSdCard///tombstones/=/sdcard/Navkingdom/tomb/
+/mnt/extSdCard///SnapShot=/sdcard/SnapShot

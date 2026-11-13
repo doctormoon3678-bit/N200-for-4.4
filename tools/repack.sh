@@ -149,12 +149,10 @@ echo "==> repacking"
 rm -rf "$WORK/apk/META-INF"
 mkdir -p "$(dirname "$OUT")"
 rm -f "$OUT"
-ZIPFLAGS=(-q -X)
-if [ "$STORE" -eq 1 ]; then ZIPFLAGS+=(-0); else ZIPFLAGS+=(-9); fi
-# Feed entry names in explicitly: "zip -r archive ." prefixes every name with
-# "./" in some zip builds, and Android looks entries up by exact name.
-( cd "$WORK/apk" && find . -type f | sed 's|^\./||' | LC_ALL=C sort \
-    | zip "${ZIPFLAGS[@]}" "$WORK/unsigned.apk" -@ )
+# Rebuild with the original's entry order, per-entry compression method and
+# MS-DOS metadata, so the repack differs from a package known to install only in
+# the bytes that were deliberately changed.
+python3 "$REPO/tools/rezip.py" "$WORK/apk" "$APK" "$WORK/unsigned.apk"
 
 # -------------------------------------------------------------- sign
 # JAR signing (APK Signature Scheme v1) is what Android 4.4 verifies.
