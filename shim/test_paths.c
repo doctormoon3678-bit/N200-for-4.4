@@ -25,6 +25,7 @@ int   n200_access(const char *, int);
 void *n200_opendir(const char *);
 int   closedir(void *);
 int   _Z22NaviGetNaviSDCardStatev(void);
+int   n200_strcasecmp(const char *, const char *);
 int   _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *, void *, void *, void *, ...);
 int   n200_mkdir(const char *, unsigned);
 int   n200_unlink(const char *);
@@ -299,6 +300,17 @@ int main(int argc, char **argv)
         ck(n > 0 && strstr(log, "unremarkable") == NULL,
            "  while uninteresting messages are filtered out");
     }
+
+    /* The comparison OnMediaMountEvent makes, with what Java really sends. */
+    ck(n200_strcasecmp("mnt/extSdCard", "/mnt/extSdCard//") == 0 &&
+       n200_strcasecmp("mnt/extSdCard", "mnt/extSdCard//") == 0,
+       "the card's mount name matches with or without trailing slashes");
+    ck(n200_strcasecmp("mnt/extSdCard/Navkingdom", "mnt/extSdCard//") != 0 &&
+       n200_strcasecmp("storage/usb0", "mnt/extSdCard//") != 0,
+       "  but only the root itself, and not another mount");
+    ck(n200_strcasecmp("Hello", "hELLO") == 0 && n200_strcasecmp("abc", "abd") < 0 &&
+       n200_strcasecmp("abc", "ab") > 0,
+       "  and strcasecmp is otherwise unchanged");
 
     check_gps(ck, ck_skip_named);
 

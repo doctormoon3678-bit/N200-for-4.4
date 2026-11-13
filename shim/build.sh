@@ -60,7 +60,7 @@ cat > "$WORK/export.map" <<'EOF'
   global:
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
-    utimes; statfs; system;
+    utimes; statfs; system; strcasecmp;
     n200fs_note;
     _Z22NaviGetNaviSDCardStatev;
     _Z22mdGetFirstLayerOnStatev;
@@ -131,6 +131,7 @@ rename
 rmdir
 stat
 statfs
+strcasecmp
 system
 unlink
 utimes"

@@ -34,7 +34,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 RENAME=""
 for s in fopen open stat access opendir mkdir rmdir unlink remove rename \
-         utimes statfs system; do
+         utimes statfs system strcasecmp; do
     RENAME="$RENAME -D$s=n200_$s"
 done
 

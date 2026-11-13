@@ -1595,7 +1595,7 @@ static int parse_gps(const char *v)
  * ====================================================================== */
 
 int g_sdstate = 1;
-int g_force = 1;
+int g_force = 0;      /* force=on in n200fs.conf releases stuck gates */
 
 /*
  * All five values CNaviReadyScene and its neighbours poll are getters defined
@@ -1930,3 +1930,60 @@ int sym(void *a0, void *a1, void *a2, void *a3, ...) \
 TRACE_HOOK(_ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z, "trace  ")
 TRACE_HOOK(_ZN14NVDebugMessage8traceErrEiPKcS1_S1_z, "traceE ")
 TRACE_HOOK(_ZN14NVDebugMessage8traceWarEiPKcS1_S1_z, "traceW ")
+
+/* ====================================================================== *
+ *  The mount name that never matched
+ *
+ *  CCommonEventHandler::OnMediaMountEvent, in libNV_GUI.so, decides whether a
+ *  mount event is the navigation card with
+ *
+ *      strcasecmp(mountName, "/mnt/extSdCard//")
+ *      strcasecmp(mountName, "mnt/extSdCard//")
+ *
+ *  -- both with two trailing slashes -- and only then calls SDCardChk(), whose
+ *  INSERT branch sends eCNS2K_NPND_LoadNaviProcess and clears the unload
+ *  flag. The Java side sends PATH_SDCARD, which is "mnt/extSdCard" with none.
+ *  The comparison fails, the event falls through to the USB branch, fails
+ *  there too, and the handler returns having done nothing: a device trace
+ *  shows BEGIN and END four ticks apart with no SDCardChk between them. That
+ *  is the whole of the "preparing navigation" hang.
+ *
+ *  The string cannot be lengthened in the dex, so make the comparison agree
+ *  instead: libNV_GUI.so imports strcasecmp, and here two spellings of the
+ *  card root that differ only in a leading slash or trailing slashes compare
+ *  equal. Everything else is an ordinary ASCII case-insensitive compare.
+ * ====================================================================== */
+
+static int lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+/* "/mnt/extSdCard", "mnt/extSdCard//", ... -- the card root and nothing more */
+static int is_card_root(const char *p)
+{
+    static const char R[] = "mnt/extsdcard";
+    int i;
+    if (*p == '/') p++;
+    for (i = 0; R[i]; i++)
+        if (lc((unsigned char)p[i]) != R[i]) return 0;
+    p += i;
+    while (*p == '/') p++;
+    return *p == 0;
+}
+
+int strcasecmp(const char *a, const char *b)
+{
+    const unsigned char *x = (const unsigned char *)a;
+    const unsigned char *y = (const unsigned char *)b;
+    if ((x[0] == '/' || lc(x[0]) == 'm') && (y[0] == '/' || lc(y[0]) == 'm') &&
+        is_card_root(a) && is_card_root(b)) {
+        static int said;
+        if (!said) {
+            said = 1;
+            log_line("mount  card root names treated as equal: ", a, "");
+        }
+        return 0;
+    }
+    for (;; x++, y++) {
+        int d = lc(*x) - lc(*y);
+        if (d || !*x) return d;
+    }
+}
