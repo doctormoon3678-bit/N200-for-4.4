@@ -13,7 +13,7 @@ LOCAL_SRC_FILES := stub_players.cpp
 LOCAL_CPPFLAGS  := -O2 -fno-exceptions -fno-rtti -fvisibility=default -fno-lto -Wall
 
 # liblog only (NDK-stable). Used by the optional -DSTUB_TRACE=1 build.
-LOCAL_LDLIBS    := -llog
+LOCAL_LDLIBS    := -llog -ldl
 
 # Export the 16 stubbed symbols and nothing else. See stub.map for why this
 # matters: without it the statically linked libunwind/libgcc gets re-exported

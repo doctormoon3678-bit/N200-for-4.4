@@ -59,10 +59,33 @@
 //         not exactly match ../expected_symbols.txt.
 
 #if defined(STUB_TRACE) && STUB_TRACE
-#  include <android/log.h>
-#  define TRACE(...) __android_log_print(ANDROID_LOG_INFO, "n200stub", __VA_ARGS__)
+// Declared rather than #included: this file is built both with an NDK and
+// with a bare clang that has no platform headers, and the prototype is all
+// that is needed either way.
+extern "C" int __android_log_print(int, const char *, const char *, ...);
+#  define TRACE(...) __android_log_print(4 /*INFO*/, "n200stub", __VA_ARGS__)
+
+// logcat needs a desktop. The same trace also goes to n200fs.log, beside the
+// map data, where whoever is holding the phone can actually read it -- and
+// alongside the file-redirection trace, so one file shows both halves of
+// startup. Reached through dlsym, not a DT_NEEDED, so a build with no
+// redirector in it still links and simply logs nothing here.
+extern "C" void *dlsym(void *, const char *);
+#  define RTLD_DEFAULT_32 ((void *)0xffffffff)
+static void note(const char *msg)
+{
+    static void (*fn)(const char *);
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        fn = (void (*)(const char *))dlsym(RTLD_DEFAULT_32, "n200fs_note");
+    }
+    if (fn) fn(msg);
+}
+#  define NOTE(name) note(name)
 #else
 #  define TRACE(...) ((void)0)
+#  define NOTE(name) ((void)0)
 #endif
 
 // Return value handed back for start()/setDataSource()-style entry points.
@@ -114,24 +137,28 @@ DMBPlayerClass::DMBPlayerClass(dmb_notify_t notify, void* cookie, int sessionId,
     (void)notify; (void)cookie; (void)sessionId; (void)flags; (void)useHwDecoder;
     // Intentionally writes nothing: the caller owns this storage and its layout
     // is unknown. See ABI NOTES above.
+    NOTE("DMBPlayerClass::ctor()");
     TRACE("DMBPlayerClass::ctor(sessionId=%d, flags=%ld, hw=%d) [stub]",
           sessionId, flags, (int)useHwDecoder);
 }
 
 int DMBPlayerClass::start()
 {
+    NOTE("DMBPlayerClass::start()");
     TRACE("DMBPlayerClass::start() [stub] -> %d", STUB_START_RET);
     return STUB_START_RET;
 }
 
 int DMBPlayerClass::stop()
 {
+    NOTE("DMBPlayerClass::stop()");
     TRACE("DMBPlayerClass::stop() [stub]");
     return 0;
 }
 
 int DMBPlayerClass::reset()
 {
+    NOTE("DMBPlayerClass::reset()");
     TRACE("DMBPlayerClass::reset() [stub]");
     return 0;
 }
@@ -139,6 +166,7 @@ int DMBPlayerClass::reset()
 int DMBPlayerClass::setSurface(ANativeWindow* window)
 {
     (void)window;
+    NOTE("DMBPlayerClass::setSurface()");
     TRACE("DMBPlayerClass::setSurface(%p) [stub]", (void*)window);
     return 0;
 }
@@ -146,6 +174,7 @@ int DMBPlayerClass::setSurface(ANativeWindow* window)
 int DMBPlayerClass::setVolume(unsigned int volume)
 {
     (void)volume;
+    NOTE("DMBPlayerClass::setVolume()");
     TRACE("DMBPlayerClass::setVolume(%u) [stub]", volume);
     return 0;
 }
@@ -153,6 +182,7 @@ int DMBPlayerClass::setVolume(unsigned int volume)
 int DMBPlayerClass::setScanFreq(unsigned int freqKHz)
 {
     (void)freqKHz;
+    NOTE("DMBPlayerClass::setScanFreq()");
     TRACE("DMBPlayerClass::setScanFreq(%u) [stub]", freqKHz);
     return 0;
 }
@@ -161,6 +191,7 @@ int DMBPlayerClass::setDataSource(const char* uri, int serviceId,
                                   unsigned int subChannel)
 {
     (void)uri; (void)serviceId; (void)subChannel;
+    NOTE("DMBPlayerClass::setDataSource()");
     TRACE("DMBPlayerClass::setDataSource(%s, %d, %u) [stub]",
           uri ? uri : "(null)", serviceId, subChannel);
     return STUB_START_RET;
@@ -189,6 +220,7 @@ TTSPlayerClass::TTSPlayerClass(tts_notify_t notify, void* cookie, int streamType
 {
     (void)notify; (void)cookie; (void)streamType; (void)sessionId; (void)name;
     // Intentionally writes nothing. See ABI NOTES above.
+    NOTE("TTSPlayerClass::ctor()");
     TRACE("TTSPlayerClass::ctor(stream=%d, session=%d, name=%s) [stub]",
           streamType, sessionId, name ? name : "(null)");
 }
@@ -197,6 +229,7 @@ int TTSPlayerClass::start(char* pcm, int bytes, int sampleRate)
 {
     (void)pcm; (void)bytes; (void)sampleRate;
     // This is where voice guidance audio would be written to an AudioTrack.
+    NOTE("TTSPlayerClass::start()");
     TRACE("TTSPlayerClass::start(pcm=%p, bytes=%d, rate=%d) [stub, silent]",
           (void*)pcm, bytes, sampleRate);
     return STUB_START_RET;
@@ -204,6 +237,7 @@ int TTSPlayerClass::start(char* pcm, int bytes, int sampleRate)
 
 int TTSPlayerClass::stop()
 {
+    NOTE("TTSPlayerClass::stop()");
     TRACE("TTSPlayerClass::stop() [stub]");
     return 0;
 }
@@ -211,12 +245,14 @@ int TTSPlayerClass::stop()
 int TTSPlayerClass::pause(bool pause)
 {
     (void)pause;
+    NOTE("TTSPlayerClass::pause()");
     TRACE("TTSPlayerClass::pause(%d) [stub]", (int)pause);
     return 0;
 }
 
 int TTSPlayerClass::reset()
 {
+    NOTE("TTSPlayerClass::reset()");
     TRACE("TTSPlayerClass::reset() [stub]");
     return 0;
 }
@@ -224,6 +260,7 @@ int TTSPlayerClass::reset()
 bool TTSPlayerClass::IsStarted()
 {
     // Nothing is ever playing, so "not started" is the truthful answer.
+    NOTE("TTSPlayerClass::IsStarted()");
     TRACE("TTSPlayerClass::IsStarted() [stub] -> false");
     return false;
 }
@@ -231,6 +268,7 @@ bool TTSPlayerClass::IsStarted()
 int TTSPlayerClass::setVolume(unsigned int volume)
 {
     (void)volume;
+    NOTE("TTSPlayerClass::setVolume()");
     TRACE("TTSPlayerClass::setVolume(%u) [stub]", volume);
     return 0;
 }
@@ -239,6 +277,7 @@ int TTSPlayerClass::setDataSource(int sampleRate, int channels,
                                   unsigned int format)
 {
     (void)sampleRate; (void)channels; (void)format;
+    NOTE("TTSPlayerClass::setDataSource()");
     TRACE("TTSPlayerClass::setDataSource(%d, %d, %u) [stub]",
           sampleRate, channels, format);
     return STUB_START_RET;

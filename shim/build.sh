@@ -57,6 +57,7 @@ cat > "$WORK/export.map" <<'EOF'
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
     utimes; statfs; system;
+    n200fs_note;
   local: *;
 };
 EOF
@@ -101,6 +102,7 @@ fi
 want="access
 fopen
 mkdir
+n200fs_note
 open
 opendir
 remove
@@ -115,7 +117,7 @@ got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports exactly the 13 interposed entry points"
+    say ok "exports the 13 interposed entry points, plus n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true

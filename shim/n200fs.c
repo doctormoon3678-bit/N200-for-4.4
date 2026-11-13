@@ -565,23 +565,44 @@ static void write_log(void)
     s_cat(out, sizeof out, &n, g_data);
     s_cat(out, sizeof out, &n, ":\n");
     {
-        static const char *const PARTS[] = {
+        static const char *const DIRS[] = {
             "Navkingdom",
             "Navkingdom/Navi",
             "Navkingdom/Navi/CONF",
+            "Navkingdom/Navi/DB_HMI",
             "Navkingdom/Common",
             "Navkingdom/Common/DB_MAP",
+            "Navkingdom/Common/DB_SEARCH",
+            "Navkingdom/Common/DB_SEARCH/poi_img",
             "Navkingdom/Persistence",
             "Navkingdom/manual",
             0
         };
+        /* Files the engine asks for by name during startup. A directory can
+         * be there and still be half-copied. */
+        static const char *const FILES[] = {
+            "Navkingdom/NaviVersionInfo.txt",
+            "Navkingdom/NavKingdom.cfg",
+            "Navkingdom/Navi/CONF/naviConfig_N200.txt",
+            "Navkingdom/Common/DB_MAP/NF60_NPND_Korea.sti",
+            0
+        };
         int i;
-        for (i = 0; PARTS[i]; i++) {
+        for (i = 0; DIRS[i]; i++) {
             char p[PATHMAX];
-            int ok = join(p, sizeof p, g_data, PARTS[i]) && is_dir(p);
+            int ok = join(p, sizeof p, g_data, DIRS[i]) && is_dir(p);
             s_cat(out, sizeof out, &n, "  ");
             s_cat(out, sizeof out, &n, ok ? "yes  " : "NO   ");
-            s_cat(out, sizeof out, &n, PARTS[i]);
+            s_cat(out, sizeof out, &n, DIRS[i]);
+            s_cat(out, sizeof out, &n, "/\n");
+        }
+        for (i = 0; FILES[i]; i++) {
+            char p[PATHMAX];
+            int ok = join(p, sizeof p, g_data, FILES[i]) &&
+                     r_access && r_access(p, 0) == 0;
+            s_cat(out, sizeof out, &n, "  ");
+            s_cat(out, sizeof out, &n, ok ? "yes  " : "NO   ");
+            s_cat(out, sizeof out, &n, FILES[i]);
             s_cat(out, sizeof out, &n, "\n");
         }
     }
@@ -648,6 +669,28 @@ static void resolve(void)
 
 /* ---- path mapping ------------------------------------------------------ */
 
+/*
+ * Should a failure on this path be reported even though it is not one of ours?
+ *
+ * The app also carries absolute paths that only ever existed on the head unit
+ * -- /mnt/hdd/nav1/map/..., /storage/usb0/NVSLOG.CONF,
+ * /sys/devices/virtual/switch/reverse/state -- and no redirect touches those.
+ * A failure there is worth a line, because it is otherwise invisible and it
+ * looks exactly like the engine quietly giving up. The kernel pseudo
+ * filesystems are excluded: libraries probe those constantly and the misses
+ * mean nothing.
+ */
+static int worth_reporting(const char *p)
+{
+    if (!p || p[0] != '/') return 0;
+    if (s_ncmp(p, "/proc", 5) == 0) return 0;
+    if (s_ncmp(p, "/sys", 4) == 0) return 0;
+    if (s_ncmp(p, "/dev", 4) == 0) return 0;
+    if (s_ncmp(p, "/data", 5) == 0) return 0;
+    if (s_ncmp(p, "/system", 7) == 0) return 0;
+    return 1;
+}
+
 /* Is this path the app's own mutable state rather than read-only payload?
  * Persistence/ is the whole of it: the app reads these back after writing
  * them, so a read has to see the copy it wrote. */
@@ -657,6 +700,18 @@ static int is_state(const char *rest)
     if (s_ncmp(rest, "Persistence", 11) == 0) return 1;
     return 0;
 }
+
+/*
+ * Let the DMB/TTS stub write into this same log.
+ *
+ * The stub traces to logcat, which is no help to someone holding the phone
+ * with a file manager and no desktop -- and the question the trace answers,
+ * "did the engine call TTSPlayerClass::start() and then stop", is exactly the
+ * one left when the last thing in this log is a file that opened fine. The
+ * stub reaches this through dlsym rather than a DT_NEEDED, so it still works
+ * in a build that has no redirector in it.
+ */
+void n200fs_note(const char *msg);
 
 /* Append one line to n200fs.log, next to the data. */
 static void log_line(const char *a, const char *b, const char *c)
@@ -707,6 +762,15 @@ static void log_ok(const char *what, const char *orig)
     log_line("opened ", what, orig);
     if (count == 120)
         log_line("(startup trace ends here; it got at least this far)", "", "");
+}
+
+void n200fs_note(const char *msg)
+{
+    static int count;
+    if (!msg || count >= 200) return;
+    count++;
+    LOGI("%s", msg);
+    log_line("stub   ", msg, "");
 }
 
 static void log_fail(const char *what, const char *orig, const char *mapped)
@@ -804,7 +868,7 @@ void *fopen(const char *path, const char *mode)
     int w, ours;
     resolve();
     if (!r_fopen) return 0;
-    { const char *rest; ours = strip_root(path, &rest); }
+    { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = mode && (mode[0] != 'r' || s_chr(mode, '+') != 0);
     m = map_path(path, w, buf, sizeof buf);
     f = r_fopen(m, mode);
@@ -830,7 +894,7 @@ int open(const char *path, int flags, ...)
         mode = __builtin_va_arg(ap, int);
         __builtin_va_end(ap);
     }
-    { const char *rest; ours = strip_root(path, &rest); }
+    { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
     fd = r_open(m, flags, mode);

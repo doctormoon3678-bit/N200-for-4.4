@@ -78,6 +78,10 @@ else
     printf 'void __android_log_print(void){}\n' > "$TMPD/log.c"
     "$CXX" --target="$TARGET" -fPIC -nostdlib -shared -fuse-ld=lld -w \
            -x c "$TMPD/log.c" -Wl,-soname,liblog.so -o "$TMPD/liblog.so"
+    # The trace build reaches n200fs_note through dlsym, so it needs libdl.
+    printf 'void dlsym(void){}\n' > "$TMPD/dl.c"
+    "$CXX" --target="$TARGET" -fPIC -nostdlib -shared -fuse-ld=lld -w \
+           -x c "$TMPD/dl.c" -Wl,-soname,libdl.so -o "$TMPD/libdl.so"
 
     "$CXX" --target="$TARGET" -fPIC -Os \
            -ffreestanding -fno-builtin -fno-exceptions -fno-rtti \
@@ -89,7 +93,8 @@ else
     "$CXX" --target="$TARGET" -shared -nostdlib -fuse-ld=lld \
            -Wl,-soname,libstagefright_dmb.so \
            -Wl,--version-script="$HERE/jni/stub.map" \
-           "$TMPD/stub.o" "$TMPD/liblog.so" -o "$SO"
+           -Wl,--no-undefined \
+           "$TMPD/stub.o" "$TMPD/liblog.so" "$TMPD/libdl.so" -o "$SO"
 fi
 
 [ -n "$SO" ] || { echo "error: build produced no libstagefright_dmb.so" >&2; exit 1; }
@@ -177,6 +182,25 @@ echo "    ok: only NDK-stable dependencies"
 
 rm -f "$HERE/.got.txt"
 mkdir -p "$OUT"
+# Every undefined symbol must have a DT_NEEDED that can supply it. A missing
+# one is not a build error -- the library links fine and then fails to dlopen
+# on the device, which is indistinguishable from the ABI problem this stub
+# exists to remove.
+UND=$("$READELF" -sW --dyn-syms "$SO" | awk '$7=="UND" && $8!=""{sub(/@.*/,"",$8); print $8}' | sort -u)
+DEPS=" $("$READELF" -d "$SO" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | tr '\n' ' ') "
+for u in $UND; do
+    case "$u" in
+        __android_log_print) want=liblog.so ;;
+        dlsym|dlopen|dlerror) want=libdl.so ;;
+        *) echo "FAIL: unexpected undefined symbol $u" >&2; exit 1 ;;
+    esac
+    case "$DEPS" in
+        *" $want "*) ;;
+        *) echo "FAIL: $u needs $want but DT_NEEDED is[$DEPS]" >&2; exit 1 ;;
+    esac
+done
+echo "    ok: every undefined symbol is covered by a DT_NEEDED"
+
 cp "$SO" "$OUT/libstagefright_dmb.so"
 if [ -n "$TLS_SO" ] && [ -f "$TLS_SO" ]; then
     cp "$TLS_SO" "$OUT/libtextlayoutshim.so"

@@ -448,9 +448,16 @@ adb logcat -d | grep -iE "AndroidRuntime|linker|dlopen|UnsatisfiedLink|n200"
 Build the tracing stub and watch what the navigation engine asks of DMB/TTS:
 
 ```sh
-STUB_TRACE=1 stub/build.sh && tools/repack.sh --strip-dead
+STUB_TRACE=1 stub/build.sh && tools/repack.sh --sdcard --strip-dead
 adb logcat -s n200stub
 ```
+
+The same trace also goes into `n200fs.log`, beside the map data, prefixed
+`stub`. logcat needs a desktop; whoever is installing this is as likely to be
+holding the phone, and it puts both halves of startup — which files were
+opened, and what the engine asked of DMB/TTS — in one file in order. The stub
+finds that hook through `dlsym`, not a `DT_NEEDED`, so a build without the
+redirector still links and simply logs nothing there.
 
 If the engine calls `TTSPlayerClass::start()` and then stalls, it is waiting for
 a "playback finished" notification a silent stub never delivers. Make the stub
@@ -503,7 +510,8 @@ private and the repack job becomes safe to add.
 |---|---|
 | `shim/n200fs.c` | the runtime redirector, with the mapping rules in the header comment |
 | `shim/build.sh` | builds and gates it for ARM (exports, SONAME, dependencies). No NDK |
-| `shim/selftest.sh` | compiles the same source natively and checks it really redirects, against the host libc |
+| `shim/selftest.sh` | compiles the same source natively and checks it really redirects, against the host libc; `--sanitize` reruns it under ASan/UBSan |
+| `stub/jni/stub_textlayoutshim.c` | 2-symbol replacement for the 5.x-era ABI adapter, with `forc` decoded from the original |
 | `tools/inject_needed.py` | adds `libn200fs.so` as the first `DT_NEEDED` of a library, in place, without resizing it; `--verify` is the release gate |
 | `tools/test_inject.py` | tests that injection against a hand-built ELF fixture |
 | `stub/jni/stub_players.cpp` | the 16 stub symbols, with the ABI reasoning in the header comment |
