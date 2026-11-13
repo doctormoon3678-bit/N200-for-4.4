@@ -214,6 +214,21 @@ int main(int argc, char **argv)
            "  and lists the mount points, whichever root was chosen");
     }
 
+    /* 9b. A file in neither root. The app will not check the NULL it gets,
+     *     so the library has to be the thing that records it. */
+    f = n200_fopen("/mnt/extSdCard///Navkingdom/Common/DB_MAP/NOT_THERE.sti", "r");
+    ck(f == NULL, "a file in neither root still fails, as it must");
+    if (f) fclose(f);
+    snprintf(buf, sizeof buf, "%s/n200fs.log", WRITE);
+    {
+        char log[2048];
+        int n = slurp(buf, log, sizeof log);
+        ck(n > 0 && strstr(log, "FAILED") != NULL,
+           "  and the failure is recorded in n200fs.log");
+        ck(n > 0 && strstr(log, "NOT_THERE.sti") != NULL,
+           "  naming the file the app asked for");
+    }
+
     /* 10. paths that are not the app's root must be passed through untouched */
     f = n200_fopen("/etc/hostname", "r");
     ck(f != NULL, "an unrelated absolute path is not redirected");

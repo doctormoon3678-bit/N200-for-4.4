@@ -235,10 +235,14 @@ is:
 
 The card itself is never written to.
 
-A read that finds the file in neither root is logged by name. The app does not
-check `fopen`'s result, so a missing file becomes a SIGSEGV inside `fprintf`
+An `fopen` or `open` on one of the app's paths that actually fails is logged by
+name, with both the path asked for and the path it was mapped to. The app does
+not check the result, so any such failure becomes a SIGSEGV inside `fprintf`
 with nothing to say which file was wanted — that is the tombstone this project
-started from, and this turns it into a line in `n200fs.log`.
+started from, and this turns it into three lines in `n200fs.log`. The real
+outcome is logged rather than an existence check beforehand, because a file can
+be missing, unreadable, on a card that has gone away or refused because its
+directory could not be created, and all four end the same way.
 
 ```sh
 # put the original APK here (it is gitignored)
@@ -280,15 +284,32 @@ Without a desktop, the same three facts are written to
 n200fs
 redirecting /mnt/extSdCard
   reads  -> /storage/extSdCard
-  writes -> /sdcard/n200dt
+  writes -> /storage/emulated/legacy/n200dt
 
 mounted storage:
-  /storage/emulated/0 /storage/extSdCard
+  /storage/emulated/legacy(internal) /mnt/media_rw/extSdCard /storage/extSdCard
+
+map tree under /storage/extSdCard:
+  yes  Navkingdom
+  yes  Navkingdom/Navi
+  yes  Navkingdom/Navi/CONF
+  yes  Navkingdom/Common
+  yes  Navkingdom/Common/DB_MAP
+  NO   Navkingdom/Persistence
+  NO   Navkingdom/manual
+
+Anything the app then failed to open is appended below.
+FAILED fopen(read)
+    asked for: /mnt/extSdCard///Navkingdom/Navi/DB_HMI/Resources
+    looked at: /storage/extSdCard/Navkingdom/Navi/DB_HMI/Resources
 ```
 
-If that file does not appear at all, the library is not being loaded and the
-problem is not the card. If it appears and `reads` is wrong, `mounted storage`
-says what the device actually has.
+That answers the three questions in order. No file at all means the library is
+not being loaded and the card is not the problem. A wrong `reads` is answered
+by `mounted storage`, which lists every storage mount and marks the ones that
+are internal. And if the roots are right but the app still dies, the `FAILED`
+lines name the file it wanted — the tree report above them usually makes it
+obvious which directory never made it onto the card.
 
 If the read root is wrong — a card this build has not heard of, or two cards —
 name it yourself. No rebuild, and it takes effect at the next start:

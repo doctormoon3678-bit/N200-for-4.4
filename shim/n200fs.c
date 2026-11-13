@@ -446,13 +446,19 @@ static int scan_mounts(const char *primary, int probe, int layout)
             /* Only storage-shaped mount points are worth a syscall. */
             if (s_ncmp(mp, "/storage", 8) != 0 && s_ncmp(mp, "/mnt", 4) != 0)
                 continue;
-            if (pass == 0 && is_primary_alias(mp, primary))
-                continue;
-
-            if (pass == 0 && listn + k + 2 < (int)sizeof g_mounts) {
+            /* Listed before the primary-storage filter, so the log shows
+             * every storage mount the device has -- including the aliases
+             * that are skipped, since mistaking one of those for a card is
+             * exactly the failure this list is here to diagnose. */
+            if (pass == 0 && listn + k + 4 < (int)sizeof g_mounts) {
                 if (listn) s_cat(g_mounts, sizeof g_mounts, &listn, " ");
                 s_cat(g_mounts, sizeof g_mounts, &listn, mp);
+                if (is_primary_alias(mp, primary))
+                    s_cat(g_mounts, sizeof g_mounts, &listn, "(internal)");
             }
+
+            if (pass == 0 && is_primary_alias(mp, primary))
+                continue;
             if (probe && try_root(mp, layout)) {
                 found = 1;
                 break;
@@ -548,10 +554,43 @@ static void write_log(void)
     s_cat(out, sizeof out, &n, g_write);
     s_cat(out, sizeof out, &n, "\n\nmounted storage:\n  ");
     s_cat(out, sizeof out, &n, g_mounts[0] ? g_mounts : "(/proc/mounts unreadable)");
+
+    /*
+     * What the chosen read root actually holds. Probed by name rather than
+     * listed, so there is no directory entry layout to depend on -- and these
+     * are the directories the engine cannot start without, so a "no" here is
+     * the answer on its own.
+     */
+    s_cat(out, sizeof out, &n, "\n\nmap tree under ");
+    s_cat(out, sizeof out, &n, g_data);
+    s_cat(out, sizeof out, &n, ":\n");
+    {
+        static const char *const PARTS[] = {
+            "Navkingdom",
+            "Navkingdom/Navi",
+            "Navkingdom/Navi/CONF",
+            "Navkingdom/Common",
+            "Navkingdom/Common/DB_MAP",
+            "Navkingdom/Persistence",
+            "Navkingdom/manual",
+            0
+        };
+        int i;
+        for (i = 0; PARTS[i]; i++) {
+            char p[PATHMAX];
+            int ok = join(p, sizeof p, g_data, PARTS[i]) && is_dir(p);
+            s_cat(out, sizeof out, &n, "  ");
+            s_cat(out, sizeof out, &n, ok ? "yes  " : "NO   ");
+            s_cat(out, sizeof out, &n, PARTS[i]);
+            s_cat(out, sizeof out, &n, "\n");
+        }
+    }
+
     s_cat(out, sizeof out, &n,
-          "\n\nIf 'reads' is wrong, put the map tree at <card>/Navkingdom,\n"
+          "\nIf 'reads' is wrong, put the map tree at <card>/Navkingdom,\n"
           "or name the card in n200fs.conf next to this file:\n"
-          "  data=/your/card\n");
+          "  data=/your/card\n"
+          "\nAnything the app then failed to open is appended below.\n");
 
     /* O_WRONLY|O_CREAT|O_TRUNC. Generic Linux values, the same on ARM. */
     fd = r_open(path, 1 | 0100 | 01000, 0644);
@@ -619,35 +658,48 @@ static int is_state(const char *rest)
     return 0;
 }
 
-/*
- * Record a read that found nothing in either root.
- *
- * This is the single most useful thing this library can report. The app does
- * not check fopen's result, so a missing file becomes a SIGSEGV inside
- * fprintf with nothing in the log to say which file was wanted -- which is
- * the tombstone this project started from. Appending the path here turns a
- * force-close into a named missing file.
- */
-static void log_miss(const char *path)
+/* Append one line to n200fs.log, next to the data. */
+static void log_line(const char *a, const char *b, const char *c)
 {
-    static int count;
     char p[PATHMAX];
     int fd;
-
-    if (count >= 40) return;
-    count++;
-    LOGE("not found in either root: %s", path);
     if (!r_open || !r_write || !g_write[0]) return;
     if (!join(p, sizeof p, g_write, "n200fs.log")) return;
     /* O_WRONLY|O_CREAT|O_APPEND */
     fd = r_open(p, 1 | 0100 | 02000, 0644);
     if (fd < 0) return;
-    r_write(fd, "missing: ", 9);
-    r_write(fd, path, (u32)s_len(path));
+    if (a) r_write(fd, a, (u32)s_len(a));
+    if (b) r_write(fd, b, (u32)s_len(b));
+    if (c) r_write(fd, c, (u32)s_len(c));
     r_write(fd, "\n", 1);
     if (r_close) r_close(fd);
-    if (count == 40)
-        LOGE("(further missing-file reports suppressed)");
+}
+
+/*
+ * Record a call that actually failed on one of the app's paths.
+ *
+ * This is the single most useful thing this library can report, and it reports
+ * the real outcome rather than guessing from an existence check beforehand:
+ * a file can be missing, unreadable, on a card that has gone away, or refused
+ * because the directory could not be created, and all four end the same way.
+ * The app never checks fopen's result, so any of them becomes a SIGSEGV
+ * inside fprintf with nothing to say which file was wanted -- the tombstone
+ * this project started from. Naming both the path asked for and the path it
+ * was mapped to turns a force-close into one line.
+ */
+static void log_fail(const char *what, const char *orig, const char *mapped)
+{
+    static int count;
+    if (count >= 40) return;
+    count++;
+    LOGE("%s FAILED: %s -> %s", what, orig, mapped);
+    log_line("FAILED ", what, "");
+    log_line("    asked for: ", orig, "");
+    log_line("    looked at: ", mapped, "");
+    if (count == 40) {
+        LOGE("(further failure reports suppressed)");
+        log_line("(further failure reports suppressed)", "", "");
+    }
 }
 
 /* Does p start with the app's hard-coded root, as a whole path component? */
@@ -712,10 +764,9 @@ static const char *map_path(const char *p, int want_write, char *buf, int cap)
         if (join(buf, cap, second, rest) &&
             r_access && r_access(buf, 0) == 0)
             return buf;
-        /* In neither root. The app does not check for that and will crash on
-         * the NULL it gets back, so say which file it was while we still
-         * know. */
-        log_miss(p);
+        /* In neither root. Hand back the preferred one so the caller fails
+         * with a sensible path; whether that failure matters is decided by
+         * the caller, and logged there. */
         if (!join(buf, cap, first, rest)) return p;
         return buf;
     }
@@ -726,17 +777,26 @@ static const char *map_path(const char *p, int want_write, char *buf, int cap)
 void *fopen(const char *path, const char *mode)
 {
     char buf[PATHMAX];
-    int w;
+    const char *m;
+    void *f;
+    int w, ours;
     resolve();
     if (!r_fopen) return 0;
+    { const char *rest; ours = strip_root(path, &rest); }
     w = mode && (mode[0] != 'r' || s_chr(mode, '+') != 0);
-    return r_fopen(map_path(path, w, buf, sizeof buf), mode);
+    m = map_path(path, w, buf, sizeof buf);
+    f = r_fopen(m, mode);
+    /* The caller will not check this, so say so here while both paths are
+     * still in hand. */
+    if (!f && ours) log_fail(w ? "fopen(write)" : "fopen(read)", path, m);
+    return f;
 }
 
 int open(const char *path, int flags, ...)
 {
     char buf[PATHMAX];
-    int mode = 0, w;
+    const char *m;
+    int mode = 0, w, ours, fd;
     resolve();
     if (!r_open) return -1;
     if (flags & O_CREAT) {
@@ -745,8 +805,12 @@ int open(const char *path, int flags, ...)
         mode = __builtin_va_arg(ap, int);
         __builtin_va_end(ap);
     }
+    { const char *rest; ours = strip_root(path, &rest); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
-    return r_open(map_path(path, w, buf, sizeof buf), flags, mode);
+    m = map_path(path, w, buf, sizeof buf);
+    fd = r_open(m, flags, mode);
+    if (fd < 0 && ours) log_fail(w ? "open(write)" : "open(read)", path, m);
+    return fd;
 }
 
 int stat(const char *path, void *st)
