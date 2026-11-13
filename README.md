@@ -207,6 +207,56 @@ symbols, because the swap is not free:
   reimplementing `TTSPlayerClass` on OpenSL ES — a contained follow-up, not a
   rewrite.
 
+## The Java card-mounted test
+
+Independent of where the data lives, and the reason the app can reach its
+"preparing navigation" screen and then sit there for ever.
+
+The engine will not start until the Java side tells it a card is present.
+`LocalServiceHMI` answers that:
+
+```java
+void RequestSDCardCheck() {
+    if (preSDcardState)
+        SetMessgeEvent(0, 1, PATH_SDCARD);      // "card is mounted"
+}
+```
+
+and `preSDcardState` is set exactly once, in `LocalServiceHMI.onCreate`:
+
+```java
+PATH_SDCARD = "mnt/extSdCard";                  // from <init>
+if (Environment.getStorageState(new File(PATH_SDCARD)).equals("mounted"))
+    preSDcardState = true;
+```
+
+`getStorageState` matches the path against the device's mounted volumes.
+`/mnt/extSdCard` is not one on any phone, so it returns `unknown`, the flag
+stays false, the event is never sent, and the engine waits. Nothing sets it
+later either: `sendEventMediaMount` is the only other writer and it only runs
+for a `MEDIA_MOUNTED` broadcast whose path equals that same string.
+
+`libn200fs.so` cannot help here — it interposes libc, and
+`Environment.getStorageState` goes to the mount service over Binder without
+touching a file.
+
+Rewriting the path is not possible for the usual reason: dex `string_ids` are
+sorted and `dexopt` checks that at install time, and every path that would
+work (`/sdcard`, `/mnt/sdcard`, `/storage/...`) sorts nowhere near `mnt`. So
+`tools/patch_sdcard_check.py` replaces the `if-eqz` that guards the assignment
+with two `nop`s:
+
+```
+ 0053  move-result    v10
+ 0054  if-eqz         v10, +4      ->  nop nop
+ 0056  iput-boolean   v13, preSDcardState
+```
+
+Two code units in, two out. No string moves, the sorted table is untouched,
+and the instruction is located by matching the surrounding pattern rather than
+a baked-in offset, so a different build is refused instead of corrupted. It is
+on by default; `--no-sdcard-check` turns it off.
+
 ## Map data on the SD card
 
 `tools/repack.sh --sdcard`. This is the mode to use if the map database is too

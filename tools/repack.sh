@@ -26,6 +26,11 @@
 #                      MUST be exactly 14 bytes -- see tools/patch_paths.py
 #   --keep-dmb         do not swap in the stub (for A/B testing only)
 #   --no-path-patch    leave /mnt/extSdCard alone (if you symlink it on-device)
+#   --no-sdcard-check  leave the Java "is the card mounted?" test alone. It is
+#                      patched by default because it answers "no" on every
+#                      phone, and the engine then waits for a card event that
+#                      never comes -- the app sits on "preparing navigation"
+#                      for ever. See tools/patch_sdcard_check.py.
 #   --writes-to-appdata  keep the map data on the SD card and redirect only the
 #                      paths the app WRITES into /data/data/com.npnd.n200/.
 #                      Fixes the fprintf-on-NULL crash without root and without
@@ -50,6 +55,7 @@ PATH_PATCH=1
 STRIP_DEAD=0
 WRITES_TO_APPDATA=0
 SDCARD=0
+SDCARD_CHECK=1
 STORE=0
 KEY_PEM="$REPO/keys/n200.key.pem"
 CERT_PEM="$REPO/keys/n200.cert.pem"
@@ -64,6 +70,7 @@ while [ $# -gt 0 ]; do
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
         --keep-dmb)    KEEP_DMB=1; shift ;;
         --no-path-patch) PATH_PATCH=0; shift ;;
+        --no-sdcard-check) SDCARD_CHECK=0; shift ;;
         --writes-to-appdata) WRITES_TO_APPDATA=1; shift ;;
         --strip-dead)  STRIP_DEAD=1; shift ;;
         --store)       STORE=1; shift ;;
@@ -223,6 +230,18 @@ elif [ "$PATH_PATCH" -eq 1 ]; then
 else
     echo "==> leaving /mnt/extSdCard in place (--no-path-patch)"
     echo "    the app will need that path to exist and be writable on the device"
+fi
+
+# ------------------------------------------------- the Java "card mounted?" test
+# Independent of where the data lives: LocalServiceHMI asks
+# Environment.getStorageState("mnt/extSdCard"), which is not a volume on any
+# phone, so it answers "no" and never sends the engine the card-mounted event
+# it is waiting for.
+if [ "$SDCARD_CHECK" -eq 1 ]; then
+    echo "==> making the Java card-mounted test always succeed"
+    python3 "$REPO/tools/patch_sdcard_check.py" "$WORK/apk"
+else
+    echo "==> leaving the Java card-mounted test alone (--no-sdcard-check)"
 fi
 
 # -------------------------------------------------------------- repack
