@@ -111,6 +111,11 @@ static const struct root ROOTS[] = {
     { "/storage/sdcard1", 1 },
     { "/Storage Card2",   0 },
     { "/Storage Card",    0 },
+    /* The head unit's "navigation is up" node. There is nothing listening on
+     * a phone, but the engine's write to it failed, and a readiness signal
+     * that cannot be written is the kind of thing a state machine waits on.
+     * Redirected so it succeeds. */
+    { "/navis/navis-onoff", 0 },
     { 0, 0 }
 };
 
@@ -769,20 +774,30 @@ static int is_state(const char *rest)
  */
 void n200fs_note(const char *msg);
 
-/* Append one line to n200fs.log, next to the data. */
+/*
+ * Append one line to n200fs.log, next to the data.
+ *
+ * Assembled into one buffer and written with a single write(), because the
+ * engine is many threads and a line built from four writes interleaves with
+ * another thread's: the device log came back with two reports spliced
+ * through each other, mid-word. One O_APPEND write of a whole line cannot
+ * tear against another.
+ */
 static void log_line(const char *a, const char *b, const char *c)
 {
-    char p[PATHMAX];
-    int fd;
+    char p[PATHMAX], line[2 * PATHMAX];
+    int fd, n = 0;
     if (!r_open || !r_write || !g_write[0]) return;
     if (!join(p, sizeof p, g_write, "n200fs.log")) return;
+    line[0] = 0;
+    if (a) s_cat(line, sizeof line, &n, a);
+    if (b) s_cat(line, sizeof line, &n, b);
+    if (c) s_cat(line, sizeof line, &n, c);
+    s_cat(line, sizeof line, &n, "\n");
     /* O_WRONLY|O_CREAT|O_APPEND */
     fd = r_open(p, 1 | 0100 | 02000, 0644);
     if (fd < 0) return;
-    if (a) r_write(fd, a, (u32)s_len(a));
-    if (b) r_write(fd, b, (u32)s_len(b));
-    if (c) r_write(fd, c, (u32)s_len(c));
-    r_write(fd, "\n", 1);
+    r_write(fd, line, (u32)n);
     if (r_close) r_close(fd);
 }
 
@@ -813,10 +828,10 @@ static void log_line(const char *a, const char *b, const char *c)
 static void log_ok(const char *what, const char *orig)
 {
     static int count;
-    if (count >= 120) return;
+    if (count >= 400) return;
     count++;
     log_line("opened ", what, orig);
-    if (count == 120)
+    if (count == 400)
         log_line("(startup trace ends here; it got at least this far)", "", "");
 }
 
