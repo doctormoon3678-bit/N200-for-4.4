@@ -82,6 +82,12 @@ int   __android_log_print(int, const char *, const char *, ...);
 /* Defined at the end of the file, used before it. */
 static void gps_start(void);
 static int  parse_gps(const char *v);
+static int  is_gps_fifo(const char *p);
+static int  gps_open_pipe(const char *path);
+static void *(*r_fdopen)(int, const char *);
+static int  is_gps_fifo(const char *p);
+static int  gps_open_pipe(const char *path);
+static void *(*r_fdopen)(int, const char *);
 
 /* open(2) flags. Generic Linux values; identical on every Android ARM ABI. */
 #define O_ACCMODE 00000003
@@ -1019,6 +1025,14 @@ void *fopen(const char *path, const char *mode)
     int w, ours;
     resolve();
     if (!r_fopen) return 0;
+    if (mode && mode[0] == 'r' && is_gps_fifo(path)) {
+        int pfd = gps_open_pipe(path);
+        if (pfd >= 0) {
+            void *fp = r_fdopen ? r_fdopen(pfd, "r") : 0;
+            if (fp) return fp;
+            if (r_close) r_close(pfd);
+        }
+    }
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = mode && (mode[0] != 'r' || s_chr(mode, '+') != 0);
     m = map_path(path, w, buf, sizeof buf);
@@ -1044,6 +1058,12 @@ int open(const char *path, int flags, ...)
         __builtin_va_start(ap, flags);
         mode = __builtin_va_arg(ap, int);
         __builtin_va_end(ap);
+    }
+    /* The engine asking for its GPS feed. Give it a pipe we control rather
+     * than a FIFO that may not exist. */
+    if ((flags & O_ACCMODE) != 1 && is_gps_fifo(path)) {
+        int pfd = gps_open_pipe(path);
+        if (pfd >= 0) return pfd;
     }
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
@@ -1267,9 +1287,6 @@ static void n200fs_init(void)
  *  keeps that honest.
  * ====================================================================== */
 
-#define FIFO_PATH "/data/data/com.npnd.n200/files/gpsfifo"
-
-static int  (*r_mkfifo)(const char *, u32);
 static int  (*r_usleep)(u32);
 static long (*r_time)(void *);
 static int  (*r_pthread_create)(void *, const void *, void *(*)(void *), void *);
@@ -1406,32 +1423,70 @@ static void send_burst(int fd)
     send_nmea(fd, "GPVTG,0.00,T,,M,0.00,N,0.00,K,A", 31);
 }
 
+/*
+ * Hand the engine a pipe instead of depending on the FIFO.
+ *
+ * The FIFO was the fragile part. GpsBridge creates it by shelling out to
+ * "mknod" or "toolbox mknod", neither of which exists on every build, and if
+ * that fails there is no node to open, no GPS at all, and nothing in any log
+ * to say why.
+ *
+ * libNV_UART.so is one of the libraries this library is bound ahead of, so its
+ * open() comes through here. When it asks for the gpsfifo, give it the read
+ * end of a pipe() and keep the write end. A pipe needs no filesystem node, no
+ * mknod, no permissions and no reader/writer handshake, and it is the same
+ * S_IFIFO to fstat() as the real thing.
+ *
+ * The cost: the real GpsBridge can no longer reach the engine while this is
+ * on, because its writes go to the path and not to this pipe. That is what
+ * gps=off is for.
+ */
+static int (*r_pipe)(int *);
+static int (*r_fcntl)(int, int, long);
+static int g_gps_wfd = -1;
+
+static int is_gps_fifo(const char *p)
+{
+    int n;
+    if (!g_gps || !p) return 0;
+    n = s_len(p);
+    return n >= 8 && s_ncmp(p + n - 8, "/gpsfifo", 8) == 0;
+}
+
+/* Returns the read end for the caller; keeps the write end for the feeder. */
+static int gps_open_pipe(const char *path)
+{
+    int fds[2];
+    if (!r_pipe || r_pipe(fds) != 0) return -1;
+    if (g_gps_wfd >= 0 && r_close) r_close(g_gps_wfd);
+    /* Non-blocking write end: if the engine stops reading, the feeder takes an
+     * EAGAIN instead of wedging on a full pipe. */
+    if (r_fcntl) r_fcntl(fds[1], 4 /* F_SETFL */, 04000 /* O_NONBLOCK */);
+    g_gps_wfd = fds[1];
+    LOGI("handing %s a pipe, feeding synthetic NMEA", path);
+    log_line("gps    engine opened the gpsfifo; feeding synthetic NMEA", "", "");
+    return fds[0];
+}
+
 static void *gps_thread(void *arg)
 {
-    int fd = -1;
+    int sent = 0, waited = 0;
     (void)arg;
     for (;;) {
-        if (fd < 0) {
-            /* Create the FIFO if GpsBridge has not. It shells out to
-             * "mknod"/"toolbox mknod", which is not present on every build;
-             * mkfifo(3) needs no shell at all. */
-            if (r_access && r_access(FIFO_PATH, 0) != 0 && r_mkfifo)
-                r_mkfifo(FIFO_PATH, 0660);
-            /* O_RDWR, not O_WRONLY: on a FIFO that never blocks waiting for a
-             * reader, and holding a read end ourselves means a write can
-             * never raise SIGPIPE and kill the app. O_NONBLOCK so a full pipe
-             * costs an EAGAIN rather than a stuck thread. */
-            if (r_open) fd = r_open(FIFO_PATH, 2 | 04000, 0);
-            if (fd < 0) {
-                if (r_usleep) r_usleep(1000000);
-                continue;
+        if (g_gps_wfd >= 0) {
+            send_burst(g_gps_wfd);
+            if (!sent) {
+                sent = 1;
+                log_line("gps    first NMEA burst written", "", "");
             }
-            LOGI("feeding synthetic NMEA into %s", FIFO_PATH);
-            log_line("gps    feeding synthetic NMEA (no real fix needed)", "", "");
+        } else if (++waited == 20) {
+            /* So that a log with no gps line at all means something definite:
+             * nothing ever asked for the fifo. */
+            log_line("gps    waiting -- nothing has opened the gpsfifo", "", "");
         }
-        send_burst(fd);
-        if (r_usleep) r_usleep(1000000);        /* 1 Hz, like a real receiver */
+        if (r_usleep) r_usleep(1000000);        /* 1 Hz, like a receiver */
     }
+    return 0;                                   /* not reached */
 }
 
 static void gps_start(void)
@@ -1439,11 +1494,13 @@ static void gps_start(void)
     static unsigned long tid;
     static int started;
     if (!g_gps || started) return;
-    r_mkfifo = (void *)dlsym(RTLD_DEFAULT, "mkfifo");
     r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
+    r_pipe = (void *)dlsym(RTLD_DEFAULT, "pipe");
+    r_fcntl = (void *)dlsym(RTLD_DEFAULT, "fcntl");
+    r_fdopen = (void *)dlsym(RTLD_DEFAULT, "fdopen");
     r_time = (void *)dlsym(RTLD_DEFAULT, "time");
     r_pthread_create = (void *)dlsym(RTLD_DEFAULT, "pthread_create");
-    if (!r_pthread_create || !r_time || !r_usleep) {
+    if (!r_pthread_create || !r_time || !r_usleep || !r_pipe) {
         LOGE("cannot start the synthetic GPS feed (missing libc entry points)");
         return;
     }

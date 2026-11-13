@@ -48,7 +48,7 @@ emit_stub() {
 
 emit_stub libdl.so  dlopen dlsym
 emit_stub liblog.so __android_log_print
-emit_stub libc.so   getenv memcpy memset mkfifo usleep time pthread_create
+emit_stub libc.so   getenv memcpy memset usleep time pthread_create pipe fcntl fdopen
 
 # ---------------------------------------------------------------- the shim
 cat > "$WORK/export.map" <<'EOF'
@@ -137,7 +137,7 @@ fi
 
 # 5. no undefined symbol beyond what those three provide
 und=$(readelf --dyn-syms -W "$WORK/libn200fs.so" | awk '$7=="UND" && $8!="" {print $8}' | sort -u)
-unexpected=$(echo "$und" | grep -vE '^(dlopen|dlsym|getenv|__android_log_print|memcpy|memset|mkfifo|usleep|time|pthread_create)$' || true)
+unexpected=$(echo "$und" | grep -vE '^(dlopen|dlsym|getenv|__android_log_print|memcpy|memset|usleep|time|pthread_create|pipe|fcntl|fdopen)$' || true)
 if [ -z "$unexpected" ]; then
     say ok "imports only: $(echo "$und" | tr '\n' ' ')"
 else

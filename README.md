@@ -248,8 +248,18 @@ $GPVTG,0.00,T,,M,0.00,N,0.00,K,A*3D
 self-test checks every sentence's checksum, the valid flag and the coordinate
 conversion rather than assuming.
 
-It also creates the FIFO with `mkfifo(3)` if `GpsBridge` has not. The bridge
-shells out to `mknod` / `toolbox mknod`, which is not present on every build.
+There is no FIFO involved. `libNV_UART.so` is one of the libraries this
+library is bound ahead of, so its `open()` of the gpsfifo comes through here,
+and what it gets back is the read end of a `pipe()` whose write end the feeder
+keeps. That matters: `GpsBridge` creates the FIFO by shelling out to `mknod` or
+`toolbox mknod`, neither of which exists on every build, and when that fails
+there is no node to open, no GPS at all, and nothing in any log to say why. A
+pipe needs no filesystem node, no permissions and no reader/writer handshake,
+and it is the same `S_IFIFO` to `fstat()` as the real thing. The self-test
+proves it by deleting the FIFO first.
+
+The cost is that the real `GpsBridge` can no longer reach the engine while this
+is on, since its writes go to the path and not to this pipe.
 
 Default position is Seoul City Hall. In `n200fs.conf`:
 

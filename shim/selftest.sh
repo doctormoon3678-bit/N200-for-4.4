@@ -53,7 +53,9 @@ echo "==> building the host self-test"
 
 # The synthetic GPS feed writes to the FIFO path compiled into the engine,
 # so the test needs that directory to exist. Skipped where it cannot be made.
-mkdir -p /data/data/com.npnd.n200/files 2>/dev/null || true
+# No FIFO is created on purpose: the redirector hands the engine a pipe, so
+# the feed must work with nothing on disk.
+rm -f /data/data/com.npnd.n200/files/gpsfifo 2>/dev/null || true
 
 run() {                      # run <label> <card-dir> <primary-dir>
     local label="$1" card="$2" primary="$3"

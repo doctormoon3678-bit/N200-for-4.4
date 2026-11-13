@@ -304,15 +304,13 @@ void check_gps(void (*ck)(int, const char *),
     char buf[4096];
     int fd, total = 0, tries, nlines = 0, bad = 0;
     int saw_rmc = 0, saw_gga = 0, saw_valid = 0, saw_coord = 0;
-    struct stat st;
-
-    if (stat(N200_FIFO, &st) != 0) {
-        cks(0, "synthetic GPS feed writes valid NMEA");
-        return;
-    }
-    fd = open(N200_FIFO, O_RDONLY | O_NONBLOCK);
+    /* Open it the way libNV_UART.so does, through the redirector. There is
+     * deliberately no FIFO on disk: the point is that a pipe comes back
+     * anyway, so the feed no longer depends on mknod having worked. */
+    fd = n200_open(N200_FIFO, O_RDONLY, 0);
+    ck(fd >= 0, "the engine's open() of the gpsfifo succeeds with no FIFO on disk");
     if (fd < 0) {
-        cks(0, "synthetic GPS feed writes valid NMEA");
+        cks(0, "  synthetic NMEA arrives through that fd");
         return;
     }
     for (tries = 0; tries < 60 && total < 400; tries++) {
@@ -343,7 +341,7 @@ void check_gps(void (*ck)(int, const char *),
             p = e + 2;
         }
     }
-    ck(nlines >= 5, "synthetic GPS feed produces NMEA sentences");
+    ck(nlines >= 5, "  synthetic NMEA arrives through that fd");
     ck(bad == 0, "  every sentence's checksum is correct");
     ck(saw_rmc, "  GPRMC is present (libNV_UART refuses to work without it)");
     ck(saw_gga, "  GPGGA is present");
