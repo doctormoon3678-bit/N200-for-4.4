@@ -15,6 +15,13 @@
 # Options:
 #   --stub PATH        stub .so            (default stub/out/libstagefright_dmb.so)
 #   --out PATH         output APK          (default out/n200-note4.apk)
+#   --sdcard           map data on the EXTERNAL SD card, writes on internal
+#                      storage. Ships libn200fs.so and makes every library that
+#                      opens a file list it ahead of libc, so the hard-coded
+#                      root is redirected per call at runtime: reads to the
+#                      card, writes to primary storage. The card's mount point
+#                      is found on the device, so this does not have to be
+#                      guessed at build time. See shim/n200fs.c.
 #   --data-root PATH   new data root       (default /sdcard/n200dt)
 #                      MUST be exactly 14 bytes -- see tools/patch_paths.py
 #   --keep-dmb         do not swap in the stub (for A/B testing only)
@@ -35,12 +42,14 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
 APK=""
 STUB="$REPO/stub/out/libstagefright_dmb.so"
+SHIM="$REPO/shim/out/libn200fs.so"
 OUT="$REPO/out/n200-note4.apk"
 DATA_ROOT="/sdcard/n200dt"
 KEEP_DMB=0
 PATH_PATCH=1
 STRIP_DEAD=0
 WRITES_TO_APPDATA=0
+SDCARD=0
 STORE=0
 KEY_PEM="$REPO/keys/n200.key.pem"
 CERT_PEM="$REPO/keys/n200.cert.pem"
@@ -49,6 +58,8 @@ VERIFY=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --stub)        STUB="$2"; shift 2 ;;
+        --shim)        SHIM="$2"; shift 2 ;;
+        --sdcard)      SDCARD=1; shift ;;
         --out)         OUT="$2"; shift 2 ;;
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
         --keep-dmb)    KEEP_DMB=1; shift ;;
@@ -76,6 +87,19 @@ if [ "$KEEP_DMB" -eq 0 ] && [ ! -f "$STUB" ]; then
     echo "error: stub not found: $STUB" >&2
     echo "       build it first:  stub/build.sh" >&2
     exit 1
+fi
+
+if [ "$SDCARD" -eq 1 ]; then
+    if [ "$WRITES_TO_APPDATA" -eq 1 ]; then
+        echo "error: --sdcard and --writes-to-appdata both decide where the" >&2
+        echo "       data lives; pick one." >&2
+        exit 1
+    fi
+    if [ ! -f "$SHIM" ]; then
+        echo "error: redirector not found: $SHIM" >&2
+        echo "       build it first:  shim/build.sh" >&2
+        exit 1
+    fi
 fi
 
 WORK="$(mktemp -d -t n200repack.XXXXXX)"
@@ -120,7 +144,20 @@ if [ "$STRIP_DEAD" -eq 1 ]; then
 fi
 
 # -------------------------------------------------------------- data root
-if [ "$WRITES_TO_APPDATA" -eq 1 ]; then
+if [ "$SDCARD" -eq 1 ]; then
+    echo "==> installing the runtime redirector (map data on the SD card)"
+    echo "    the hard-coded /mnt/extSdCard is left in place on purpose: it is"
+    echo "    the sentinel libn200fs.so matches on"
+    cp "$SHIM" "$LIBDIR/libn200fs.so"
+    python3 "$REPO/tools/inject_needed.py" "$LIBDIR" --name libn200fs.so
+    echo
+    echo "    checking every patched library binds it ahead of libc"
+    if ! python3 "$REPO/tools/inject_needed.py" "$LIBDIR" --name libn200fs.so \
+            --verify; then
+        echo "error: the redirector would not be bound; refusing to ship." >&2
+        exit 1
+    fi
+elif [ "$WRITES_TO_APPDATA" -eq 1 ]; then
     echo "==> redirecting only the written paths into the app's private directory"
     echo "    (the map database stays on the SD card where it already is)"
     # --skip-dex: classes.dex must not be touched. Its string table is sorted,
@@ -133,9 +170,23 @@ if [ "$WRITES_TO_APPDATA" -eq 1 ]; then
 elif [ "$PATH_PATCH" -eq 1 ]; then
     echo "==> repointing the data root at $DATA_ROOT"
     REL="${DATA_ROOT#/}"
+    # --skip-dex, for the same reason as above: the dex string table is sorted
+    # and dexopt verifies that at install time, so a path cannot be rewritten
+    # in place once the replacement sorts somewhere else. "/sdcard/n200dt/..."
+    # sorts past "/sdcard/gpsbridge_debug.txt", which is two slots further on,
+    # and the install simply fails.
+    #
+    # Leaving classes.dex alone is safe here. The only startup-relevant path on
+    # the Java side is the Persistence folder that LocalServiceActivities
+    # .onCreate lists: when that directory is absent it logs "fileList null"
+    # and leaves its bSystemTypeOK flag true, so the check it feeds still
+    # passes. The flag only goes false if the directory exists and holds
+    # something unexpected. Everything the app actually opens at startup is
+    # opened by the native libraries, which are patched.
     python3 "$REPO/tools/patch_paths.py" "$WORK/apk" \
         --map "/mnt/extSdCard=$DATA_ROOT" \
-        --map "mnt/extSdCard=$REL"
+        --map "mnt/extSdCard=$REL" \
+        --skip-dex
 else
     echo "==> leaving /mnt/extSdCard in place (--no-path-patch)"
     echo "    the app will need that path to exist and be writable on the device"
@@ -229,6 +280,7 @@ fi
 
 echo
 echo "==> $OUT  ($(stat -c%s "$OUT") bytes)"
+
 cat <<EOF
 
 Install:
@@ -236,10 +288,40 @@ Install:
     # must go first -- an upgrade in place will be rejected
     adb uninstall com.npnd.n200
     adb install "$OUT"
+EOF
+
+if [ "$SDCARD" -eq 1 ]; then
+cat <<'EOF'
+
+Map data (put it on the card, with a file manager or a card reader):
+    <card>/Navkingdom/...
+
+    Nothing has to be configured: at startup libn200fs.so looks for a
+    Navkingdom directory under the usual mount points (/storage/extSdCard,
+    /storage/sdcard1, /storage/external_SD, ...) and uses the first it finds.
+    Writes go to /sdcard/n200dt, on internal storage, because Android 4.4 does
+    not let an app write to the card outside Android/data/<pkg>/.
+
+    If the card is somewhere this does not guess, name it yourself -- no
+    rebuild needed:
+        adb shell 'mkdir -p /sdcard/n200dt && \
+            printf "data=/storage/<your card>\n" > /sdcard/n200dt/n200fs.conf'
+
+Check which roots it chose:
+    adb logcat -c
+    adb shell am start -n com.npnd.n200/.LocalServiceActivities
+    adb logcat -d -s n200fs
+EOF
+else
+cat <<EOF
 
 Map data:
     adb shell mkdir -p $DATA_ROOT
     adb push <your Navkingdom tree> $DATA_ROOT/Navkingdom
+EOF
+fi
+
+cat <<'EOF'
 
 Watch it start:
     adb logcat -c

@@ -1,8 +1,19 @@
 # N200 for Android 4.4
 
 Makes `n200_signed.apk` (`com.npnd.n200`, a Korean car head-unit navigation app)
-run on a stock Android 4.4 phone, by repointing its hard-coded data root and, if
-the device needs it, removing its dependency on platform-internal ABI.
+run on a stock Android 4.4 phone, by redirecting its hard-coded data root and,
+if the device needs it, removing its dependency on platform-internal ABI.
+
+**Map data on the external SD card, writes on internal storage:**
+
+```sh
+shim/build.sh
+tools/repack.sh --sdcard --keep-dmb      # -> out/n200-note4.apk
+```
+
+Put the `Navkingdom` tree anywhere on the card; the app finds it at startup.
+That is [the section below](#map-data-on-the-sd-card). The rest of this
+file explains why it needs doing that way.
 
 The APK is a head-unit ROM app: 30 native libraries, 48 MB, `armeabi`, signed
 with the public AOSP **testkey**, `debuggable=true`, `minSdk=targetSdk=19`.
@@ -47,13 +58,31 @@ the data root the app hard-codes:
 %s/%s_%s.txt                                           <- NVSLOG, written with fprintf
 ```
 
-`/mnt/extSdCard` does not exist on a Samsung KitKat device — the SD card is at
-`/storage/extSdCard` — and since KitKat `WRITE_EXTERNAL_STORAGE` no longer lets a
-third-party app write anywhere on secondary storage outside
+`/mnt/extSdCard` is not where KitKat mounts a card — Samsung puts it at
+`/storage/extSdCard`, other vendors at `/storage/sdcard1`, `/storage/ext_sd`,
+`/storage/external_SD` — and since KitKat `WRITE_EXTERNAL_STORAGE` no longer
+lets a third-party app write anywhere on secondary storage outside
 `Android/data/<package>/`, so these writes would fail even if the directory were
 there. The app hard-codes that root in **288 places across 13 files**.
 
-**This is what `tools/patch_paths.py` fixes, and it is the fix to try first.**
+### Why rewriting the strings cannot fix it
+
+The obvious repair is to rewrite that root in the `.so` files, and
+`tools/patch_paths.py` does exactly that. But a replacement has to be **no
+longer** than the string it replaces, or every file offset in the ELF moves and
+each section header, relocation and symbol table entry goes stale. `/mnt/extSdCard`
+is 14 bytes. `/storage/extSdCard` is 18. There is no 14-byte path to a KitKat
+SD card, and there is no single right answer to compile in either, because the
+mount point differs per vendor.
+
+So a string rewrite can only reach **primary** storage — `/sdcard/n200dt`, which
+happens to be 14 bytes. That works, and it is what `tools/repack.sh` does by
+default, but it forces the whole map database onto internal storage. A Korea map
+set is several gigabytes, which is exactly what the card was for.
+
+**`--sdcard` solves it a different way: it stops rewriting the paths and
+redirects them when they are used.** See
+[Map data on the SD card](#map-data-on-the-sd-card).
 
 ## The other hazard: private platform ABI
 
@@ -147,13 +176,138 @@ symbols, because the swap is not free:
   reimplementing `TTSPlayerClass` on OpenSL ES — a contained follow-up, not a
   rewrite.
 
+## Map data on the SD card
+
+`tools/repack.sh --sdcard`. This is the mode to use if the map database is too
+big for internal storage, or if it is already on a card.
+
+It ships one extra library, `libn200fs.so` (12 KB, this project's own code,
+`shim/n200fs.c`), and makes every app library that opens a file list it as its
+**first** `DT_NEEDED`, ahead of `libc.so`. On the pre-N dynamic linker that is
+all interposition takes: a library's relocations are resolved against the main
+executable, then `LD_PRELOAD`, then its own `DT_NEEDED` list *in order*, and
+nothing else. So those libraries call `fopen`, `open`, `stat`, `opendir`,
+`mkdir`, `rename`, `system` and the rest here instead of in libc, and each call
+maps the hard-coded root onto one that works:
+
+| | |
+|---|---|
+| read `/mnt/extSdCard///Navkingdom/Common/DB_MAP/x.sti` | → `<card>/Navkingdom/Common/DB_MAP/x.sti` |
+| write `/mnt/extSdCard///Navkingdom/LoggerServerPID` | → `/sdcard/n200dt/Navkingdom/LoggerServerPID` |
+
+Three things make this better than rewriting the strings, beyond lifting the
+14-byte limit:
+
+* **The split is decided per call, from the open mode** — not from a list of
+  paths. A write can therefore not be missed, and a missed write is precisely
+  what the tombstone above was.
+* **The card is found on the device**, by looking for a `Navkingdom` directory
+  under the mount points vendors actually use. The same APK works on a phone
+  that calls the card `/storage/sdcard1` and one that calls it
+  `/storage/extSdCard`.
+* **Missing write directories are created on demand.** The app assumes its tree
+  already exists and never calls `mkdir` for most of it.
+
+Reads are an overlay: the write root is consulted first, so state the app has
+written wins over the pristine copy on the card, and the card is never written
+to.
+
+```sh
+# put the original APK here (it is gitignored)
+cp /path/to/n200_signed.apk apk/n200_signed.apk
+
+shim/build.sh                              # needs clang + lld. No NDK.
+tools/repack.sh --sdcard --keep-dmb        # -> out/n200-note4.apk
+```
+
+Install, and copy the map tree to the card with a file manager or a card reader
+— not over `adb push`, which cannot write to secondary storage either:
+
+```sh
+adb uninstall com.npnd.n200          # the signature changed; no upgrade in place
+adb install out/n200-note4.apk
+#  <card>/Navkingdom/Common/DB_MAP/...
+#  <card>/Navkingdom/Navi/...
+```
+
+Check what it chose:
+
+```sh
+adb logcat -c
+adb shell am start -n com.npnd.n200/.LocalServiceActivities
+adb logcat -d -s n200fs
+```
+
+```
+I/n200fs  : read  root: /storage/extSdCard
+I/n200fs  : write root: /sdcard/n200dt
+I/n200fs  : /mnt/extSdCard -> the two roots above
+```
+
+If the read root is wrong — a card this build has not heard of, or two cards —
+name it yourself. No rebuild, and it takes effect at the next start:
+
+```sh
+adb shell 'mkdir -p /sdcard/n200dt &&
+           printf "data=/storage/MyCard\nwrite=/sdcard/n200dt\n" \
+             > /sdcard/n200dt/n200fs.conf'
+```
+
+Writes have to stay on primary storage. KitKat will not let the app write to
+the card outside `Android/data/com.npnd.n200/`, so `write=` pointing at the card
+would put the `fprintf`-on-NULL crash straight back.
+
+### How the library gets in front of libc
+
+Adding a `DT_NEEDED` entry normally means relinking, which is not an option
+here — these are vendor binaries with no source. `tools/inject_needed.py` adds
+one in place instead, and it fits because of two coincidences worth knowing
+about:
+
+* **`.dynamic` is padded.** Every library in this APK carries four or five
+  unused 8-byte slots of zeroes past its `DT_NULL` terminator. One becomes the
+  new entry and `DT_NULL` moves up by one. (A modern linker does not do this —
+  `lld` packs the section exactly — so the technique works on these libraries
+  and would not on a fresh build.)
+* **The name can live in that same padding.** `.dynstr` is full in every one of
+  these libraries — there is not one dead byte anywhere in it — so the string
+  goes into the slots after the new `DT_NULL` and is addressed by its own
+  virtual address:
+
+  ```
+  d_val = (.dynamic vaddr + 8*(slots_used+1)) - (.dynstr vaddr)
+  ```
+
+  Android 4.4 computes `strtab + d_val` and never looks at `DT_STRSZ`, so the
+  sum lands on the string. `DT_STRSZ` is widened to cover it anyway: bionic
+  grew a bounds check on string indices in Android 7, and it costs nothing to
+  satisfy it.
+
+The new entry is made the *first* `DT_NEEDED`, with the existing ones shifted
+along so their order relative to each other is untouched. First, not merely
+before `libc.so`, because in `libpowertts.so` libc is already first.
+
+Nothing moves: no section header, relocation, symbol or program header changes,
+and the repack gate confirms that **no entry changed size relative to the
+original**.
+
+Two properties of these libraries had to hold for this to work at all, and
+`inject_needed.py --verify` asserts both on every build:
+
+* the redirector must end up ahead of `libc.so`, and
+* no library may define one of the interposed names itself — every one of them
+  is built `-Bsymbolic`, so the linker searches the library before it looks at
+  `DT_NEEDED` at all, and a local definition would win. None do.
+
 ## Usage
 
 Requirements: a JDK with `jarsigner`/`keytool`, `zip`/`unzip`, Python 3.9+, and
-`readelf`. Only the optional stub needs an NDK.
+`readelf`. `--sdcard` needs a clang that can emit ARM, plus `lld`. Only the
+optional DMB stub needs an NDK.
 
-**Start here.** Repoint the data root and leave the vendor libraries alone —
-this is the fix for the crash above, and it keeps DMB and voice guidance:
+**Everything on internal storage** — the original fix, which rewrites the root
+to `/sdcard/n200dt` and leaves the vendor libraries alone. Simpler, but the map
+database has to fit in internal storage:
 
 ```sh
 # put the original APK here (it is gitignored)
@@ -227,17 +381,33 @@ The job log also prints the finished library's `DT_NEEDED` list, SONAME,
 exported symbols and ARM build attributes, which is the evidence that the swap
 is sound.
 
+`.github/workflows/build-shim.yml` does the same for `libn200fs.so`, and needs
+no NDK at all — clang is the whole toolchain. It runs three gates in increasing
+cost: the injection tests (`tools/test_inject.py`, pure byte surgery, no
+compiler), the redirection self-test (`shim/selftest.sh`, the real logic against
+the host's libc), then the ARM build. The artifact is named `libn200fs`:
+
+```sh
+gh run download --name libn200fs
+tools/repack.sh --sdcard --keep-dmb --shim libn200fs.so
+```
+
 **Repacking is deliberately not in CI.** This repository is public, and so are
 its Actions artifacts and logs. Committing `n200_signed.apk`, fetching it during
 a run, or uploading a repacked copy would publish a commercial navigation app
-and its map engine to anyone who finds the repo. So CI stops at the stub — the
-one piece that is this project's own code — and `tools/repack.sh` stays local.
-Make the repository private and the repack job becomes safe to add.
+and its map engine to anyone who finds the repo. So CI stops at this project's
+own two libraries, and `tools/repack.sh` stays local. Make the repository
+private and the repack job becomes safe to add.
 
 ## Tools
 
 | | |
 |---|---|
+| `shim/n200fs.c` | the runtime redirector, with the mapping rules in the header comment |
+| `shim/build.sh` | builds and gates it for ARM (exports, SONAME, dependencies). No NDK |
+| `shim/selftest.sh` | compiles the same source natively and checks it really redirects, against the host libc |
+| `tools/inject_needed.py` | adds `libn200fs.so` as the first `DT_NEEDED` of a library, in place, without resizing it; `--verify` is the release gate |
+| `tools/test_inject.py` | tests that injection against a hand-built ELF fixture |
 | `stub/jni/stub_players.cpp` | the 16 stub symbols, with the ABI reasoning in the header comment |
 | `stub/build.sh` | builds and gates the stub (symbol set, SONAME, dependencies) |
 | `tools/audit.py` | prints the `System.loadLibrary` sequence from `classes.dex` and marks which loads reach private ABI — tells you *where* startup dies |
@@ -267,9 +437,15 @@ Checked directly, against the real APK:
   stub safe. The ctor bodies deliberately write nothing: the callers already
   have `sizeof()` baked in from their own build.
 * Path patching is byte-for-byte equal length, so no file offset moves: ELF
-  headers, relocations and symbol tables stay valid, and the dex string table's
-  ULEB128 length prefixes stay correct. The dex adler32 checksum and SHA-1
-  signature are recomputed, and both verify afterwards.
+  headers, relocations and symbol tables stay valid. `classes.dex` is left
+  alone — `--skip-dex` on every mode that patches paths. It has to be: the dex
+  string table is sorted and `dexopt` verifies that at install time, and
+  `/sdcard/n200dt/Navkingdom/Persistence/` sorts past
+  `/sdcard/gpsbridge_debug.txt` two slots later, so rewriting it in place makes
+  the install fail with no useful error. `tools/patch_paths.py` can still
+  rewrite a dex, with the ULEB128 length prefixes, adler32 and SHA-1 all
+  maintained, and it refuses rather than shipping a file dexopt would reject;
+  no replacement that keeps the ordering has been found.
 * Repack and signing produce an APK whose signature verifies, with **SHA-256**
   digests pinned. This matters: left to itself, JDK 21 writes SHA-384, which
   API 19 is not documented to accept. SHA1 is not an option either — recent
@@ -330,6 +506,67 @@ Still not verified:
   `tools/repack.sh --strip-dead` will tell you.
 * Whether the navigation engine tolerates a silent TTS sink. See the tracing
   build above.
+
+### The redirector, specifically
+
+Checked directly:
+
+* The redirection logic is **run, not just inspected**. `shim/selftest.sh`
+  compiles `shim/n200fs.c` natively — the same source, nothing stubbed out,
+  including its load-time constructor — and exercises it against the host's
+  libc in three scenarios: card auto-detected from the built-in mount-point
+  list, card named by `n200fs.conf`, and no card at all. It checks that a map
+  read reaches the card, that `fopen(..., "w")` on a path whose directory does
+  not exist still returns a stream (the tombstone case) and lands on primary
+  storage, that the card is never written to, that a written file shadows the
+  card copy on read, that `system()` has the root rewritten inside the command
+  text, and that an unrelated path is passed through untouched.
+* The built library is ELF32 / DYN / ARM, SONAME `libn200fs.so`, 12 KB,
+  depending on nothing but libc, libdl and liblog, importing four symbols and
+  exporting **exactly** the 13 it interposes. An extra export would be bound by
+  the app's libraries in place of libc's, so the build fails on one.
+* The injection is tested against a hand-built ELF fixture
+  (`tools/test_inject.py`): order preserved with the new entry first, the name
+  readable by the linker's own rule rather than through section headers,
+  `DT_STRSZ` widened, no byte outside `.dynamic` touched, idempotent, and it
+  refuses a library with no padding, a name that would not fit, or padding that
+  is not zero.
+* On the real APK: all 19 libraries that call an interposed entry point take
+  the dependency ahead of `libc.so`, none defines one of those names itself,
+  the repack gate reports **no entry changed size relative to the original**,
+  `classes.dex` is not touched at all, and the signature verifies under both
+  `tools/sign_v1.py`'s own check and `jarsigner`.
+
+Not verified:
+
+* **None of it has run on a device.** Everything above is a build-machine
+  result. The two things a device decides are whether Android 4.4 accepts a
+  `DT_NEEDED` name stored past `DT_STRSZ` — it has no bounds check there, and
+  `DT_STRSZ` is widened to cover the string regardless — and whether the
+  dynamic linker's mutex tolerates the `dlopen` the constructor makes while the
+  linker is loading the library. It is recursive on 4.4, which is why a
+  constructor calling `dlopen`/`dlsym` is a common pattern, but that is
+  reasoning, not a test. If either is wrong the symptom is unambiguous and
+  appears at the first `System.loadLibrary`:
+
+  ```
+  dlopen failed: could not load library "..." needed by "libNV_CNS2K.so"
+  ```
+
+  and the fallback is the string-rewrite build (`tools/repack.sh --keep-dmb`,
+  everything on internal storage), which does not use any of this.
+* **Which mount points real devices use.** The candidate list in
+  `shim/n200fs.c` covers the names vendors are known to use, but it is a list,
+  not a survey. `adb logcat -s n200fs` says which one was taken, and
+  `n200fs.conf` overrides it without a rebuild.
+* **The Java half is not redirected.** `java.io.File` goes through libjavacore,
+  which this library is not in front of, so the few paths `classes.dex` holds
+  still read `/mnt/extSdCard`. None of them block startup:
+  `LocalServiceActivities.onCreate` lists
+  `/mnt/extSdCard/Navkingdom/Persistence` and, when the directory is simply
+  absent, logs `fileList null` and leaves its `bSystemTypeOK` flag at its
+  initial `true` — the gate it feeds only fails if that directory *exists* with
+  unexpected contents. The rest is `SWUpdater`, screen capture and logging.
 
 ## Known remaining obstacles
 

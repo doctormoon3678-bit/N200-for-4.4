@@ -1,0 +1,80 @@
+name: build shim
+
+# Builds and gates libn200fs.so, the runtime data-root redirector, and tests
+# the DT_NEEDED injection that puts it in front of libc.
+#
+# Unlike the stub, none of this needs an NDK. The shim includes no libc headers
+# and dereferences no kernel structure, so a clang that can emit ARM is the
+# whole toolchain -- and the same source compiles natively, which is what lets
+# the self-test exercise the real redirection logic against the host's libc
+# instead of only inspecting the binary.
+#
+# The APK is not here, for the reason given in build-stub.yml: this repository
+# is public and its artifacts are too. Both jobs work on this project's own
+# code only.
+
+on:
+  push:
+    paths:
+      - 'shim/**'
+      - 'tools/inject_needed.py'
+      - 'tools/test_inject.py'
+      - '.github/workflows/build-shim.yml'
+  pull_request:
+    paths:
+      - 'shim/**'
+      - 'tools/inject_needed.py'
+      - 'tools/test_inject.py'
+      - '.github/workflows/build-shim.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in shim/*.sh tools/*.sh; do bash -n "$f" && echo "  ok  $f"; done
+          python3 -m py_compile tools/*.py && echo "  ok  tools/*.py"
+
+      # Cheapest first: the injector is pure byte surgery and needs no compiler.
+      - name: DT_NEEDED injection
+        run: python3 tools/test_inject.py
+
+      # The redirection logic, run for real against glibc.
+      - name: Redirection self-test
+        run: shim/selftest.sh
+
+      - name: Build for ARM
+        run: shim/build.sh
+
+      - name: Show what came out
+        shell: bash
+        run: |
+          set -euo pipefail
+          so=shim/out/libn200fs.so
+          echo "$so ($(stat -c%s "$so") bytes)"
+          readelf -h "$so" | grep -E 'Class|Machine|Type:'
+          echo "-- DT_NEEDED / SONAME --"
+          readelf -d "$so" | grep -E 'NEEDED|SONAME'
+          echo "-- exported --"
+          readelf -sW --dyn-syms "$so" \
+            | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print "   "$8}' | sort -u
+          echo "-- imported --"
+          readelf -sW --dyn-syms "$so" \
+            | awk '$7=="UND" && $8!=""{print "   "$8}' | sort -u
+          echo "-- ARM build attributes --"
+          readelf -A "$so" | grep -E 'Tag_CPU_arch|Tag_FP_arch|Tag_ABI_VFP' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libn200fs
+          path: shim/out/libn200fs.so
+          if-no-files-found: error
