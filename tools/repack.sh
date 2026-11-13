@@ -190,12 +190,23 @@ echo "    digest: $(unzip -p "$OUT" META-INF/MANIFEST.MF | grep -m1 -oE 'SHA-?[0
 # -------------------------------------------------------------- audit
 if [ "$VERIFY" -eq 1 ]; then
     echo
-    python3 "$REPO/tools/verify_abi.py" "$OUT" || {
+    if ! python3 "$REPO/tools/verify_abi.py" "$OUT"; then
         echo
-        echo "The repacked APK still carries private platform dependencies." >&2
-        echo "It was written to $OUT anyway so you can inspect it." >&2
-        exit 1
-    }
+        if [ "$KEEP_DMB" -eq 1 ]; then
+            # Not a gate here. --keep-dmb means the original vendor library was
+            # kept on purpose, so of course its private platform dependencies
+            # are still listed. Whether they resolve is a property of the device,
+            # and on a Samsung KitKat build they have been observed to.
+            echo "This is expected with --keep-dmb: the original"
+            echo "libstagefright_dmb.so was kept, so its private platform"
+            echo "dependencies are still there. Whether they resolve is up to the"
+            echo "device. Drop --keep-dmb to swap in the stub if they do not."
+        else
+            echo "The repacked APK still carries private platform dependencies." >&2
+            echo "It was written to $OUT anyway so you can inspect it." >&2
+            exit 1
+        fi
+    fi
 fi
 
 echo
