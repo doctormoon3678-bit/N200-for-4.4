@@ -205,6 +205,7 @@ static int   (*r_close)(int);
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
 static char g_mounts[512];       /* storage mount points, for the log      */
+static int  g_enginelog = 1;     /* switch on the engine's own log file     */
 static volatile int g_ready;     /* 1 once both roots are usable           */
 static volatile int g_busy;      /* re-entry guard for the resolve step    */
 
@@ -334,6 +335,8 @@ static void read_conf(const char *path)
                     s_copy(g_data, sizeof g_data, line + 5);
                 else if (s_ncmp(line, "write=", 6) == 0 && line[6])
                     s_copy(g_write, sizeof g_write, line + 6);
+                else if (s_ncmp(line, "enginelog=", 10) == 0)
+                    g_enginelog = line[10] != '0';
             }
         }
         start = i + 1;
@@ -611,6 +614,8 @@ static void write_log(void)
         static const char *const FILES[] = {
             "Navkingdom/NaviVersionInfo.txt",
             "Navkingdom/NavKingdom.cfg",
+            "Navkingdom/Common/SystemInfo_Map.xml",
+            "Navkingdom/Common/DB_MAP/READY_NF60_NPND_Korea.sti",
             "Navkingdom/Navi/CONF/naviConfig_N200.txt",
             "Navkingdom/Common/DB_MAP/NF60_NPND_Korea.sti",
             0
@@ -685,6 +690,29 @@ static void resolve(void)
         read_conf(conf);
 
     pick_roots();
+
+    /*
+     * Switch on the engine's own logging.
+     *
+     * It looks for Navkingdom/log_start_flag_true and, finding it, writes a
+     * detailed trace of its own -- which says far more about why it will not
+     * start than watching its file calls from outside ever can. Creating the
+     * flag in the write root is enough: a read of it comes through the overlay
+     * and finds it there. Put enginelog=0 in n200fs.conf to stop this.
+     */
+    if (g_enginelog && r_open) {
+        char f[PATHMAX];
+        if (join(f, sizeof f, g_write, "Navkingdom/log_start_flag_true")) {
+            make_parents(f);
+            if (r_access && r_access(f, 0) != 0) {
+                int fd = r_open(f, 1 | 0100, 0644);   /* O_WRONLY|O_CREAT */
+                if (fd >= 0) {
+                    if (r_close) r_close(fd);
+                    LOGI("created %s (engine logging on)", f);
+                }
+            }
+        }
+    }
 
     LOGI("read  root: %s", g_data);
     LOGI("write root: %s", g_write);
@@ -799,6 +827,31 @@ void n200fs_note(const char *msg)
     count++;
     LOGI("%s", msg);
     log_line("stub   ", msg, "");
+}
+
+/*
+ * stat/access/opendir that found nothing, each distinct path reported once.
+ *
+ * These are how the engine asks "is it there yet", and when it is stuck it
+ * asks in a loop -- so logging every miss would bury the log, and logging none
+ * (which is what this did until now) hides the one thing that matters: which
+ * file it is waiting for. Deduplicating gives one line per distinct question.
+ */
+static void log_probe_fail(const char *what, const char *orig)
+{
+    static char seen[24][96];
+    static int nseen;
+    int i;
+
+    for (i = 0; i < nseen; i++)
+        if (s_ncmp(seen[i], orig, 95) == 0) return;
+    if (nseen < 24) {
+        s_copy(seen[nseen], 96, orig);
+        nseen++;
+    }
+    LOGI("%s missing: %s", what, orig);
+    log_line("probe  ", what, "");
+    log_line("    missing: ", orig, "");
 }
 
 static void log_fail(const char *what, const char *orig, const char *mapped)
@@ -982,26 +1035,42 @@ int open(const char *path, int flags, ...)
 int stat(const char *path, void *st)
 {
     char buf[PATHMAX];
+    const char *rest;
+    int rc, ours;
     resolve();
     if (!r_stat) return -1;
-    return r_stat(map_path(path, 0, buf, sizeof buf), st);
+    ours = strip_root(path, &rest);
+    rc = r_stat(map_path(path, 0, buf, sizeof buf), st);
+    if (rc < 0 && ours) log_probe_fail("stat", path);
+    return rc;
 }
 
 int access(const char *path, int amode)
 {
     char buf[PATHMAX];
+    const char *rest;
+    int rc, ours;
     resolve();
     if (!r_access) return -1;
+    ours = strip_root(path, &rest);
     /* W_OK is 2: an access(W_OK) check is about to be followed by a write. */
-    return r_access(map_path(path, (amode & 2) != 0, buf, sizeof buf), amode);
+    rc = r_access(map_path(path, (amode & 2) != 0, buf, sizeof buf), amode);
+    if (rc < 0 && ours && (amode & 2) == 0) log_probe_fail("access", path);
+    return rc;
 }
 
 void *opendir(const char *path)
 {
     char buf[PATHMAX];
+    const char *rest;
+    void *d;
+    int ours;
     resolve();
     if (!r_opendir) return 0;
-    return r_opendir(map_path(path, 0, buf, sizeof buf));
+    ours = strip_root(path, &rest);
+    d = r_opendir(map_path(path, 0, buf, sizeof buf));
+    if (!d && ours) log_probe_fail("opendir", path);
+    return d;
 }
 
 int mkdir(const char *path, u32 mode)
