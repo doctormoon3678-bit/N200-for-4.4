@@ -62,7 +62,7 @@ typedef unsigned long  ulong;
 void *dlopen(const char *, int);
 void *dlsym(void *, const char *);
 char *getenv(const char *);
-int   __android_log_print(int, const char *, const char *, ...);
+int   __android_log_print(int, const char *, const char *, ...);   /* defined below */
 
 /* Bionic's values. Overridable only so that shim/selftest.sh can exercise this
  * file against glibc on a build machine, where all three differ. */
@@ -1986,4 +1986,82 @@ int strcasecmp(const char *a, const char *b)
         int d = lc(*x) - lc(*y);
         if (d || !*x) return d;
     }
+}
+
+/* ====================================================================== *
+ *  Capturing the modules that log through Android's logger
+ *
+ *  libNV_MD.so (the map renderer) and libNV_CNS2K.so do not use
+ *  NVDebugMessage; they call __android_log_print directly, so nothing they
+ *  say reaches n200fs.log through the trace hooks above -- and the map
+ *  renderer is exactly the module whose "first layer on" state never comes
+ *  true. Both import __android_log_print, so it is answered here: the call is
+ *  passed on to liblog unchanged, and for callers in those two libraries a
+ *  copy goes to n200fs.log, tagged "alog".
+ *
+ *  The caller is identified from the return address with dladdr(), cached per
+ *  address, so the cost for everyone else is one table probe.
+ * ====================================================================== */
+
+static int wanted_caller(const void *ra)
+{
+    static const void *key[64];
+    static char val[64];
+    void *info[4];
+    const char *f;
+    unsigned h = (unsigned)(((unsigned long)ra >> 2) & 63);
+    int i, hit = 0;
+
+    if (key[h] == ra) return val[h];
+    key[h] = ra;
+    val[h] = 0;
+    if (!r_dladdr)
+        r_dladdr = (int (*)(const void *, void *))dlsym(RTLD_DEFAULT, "dladdr");
+    if (!r_dladdr || !r_dladdr(ra, info) || !info[0]) return 0;
+    f = (const char *)info[0];
+    for (i = 0; f[i]; i++)
+        if (s_ncmp(f + i, "libNV_MD", 8) == 0 || s_ncmp(f + i, "libNV_CNS2K", 11) == 0)
+            hit = 1;
+    val[h] = (char)hit;
+    return hit;
+}
+
+int __android_log_print(int prio, const char *tag, const char *fmt, ...)
+{
+    static int (*real_v)(int, const char *, const char *, __builtin_va_list);
+    static int tried, count;
+    __builtin_va_list ap;
+    int r = 0;
+
+    if (!tried) {
+        void *h;
+        tried = 1;
+        h = dlopen("liblog.so", RTLD_NOW);
+        if (h) real_v = (int (*)(int, const char *, const char *,
+                                 __builtin_va_list))dlsym(h, "__android_log_vprint");
+    }
+    if (g_trace && count < 1500 && fmt &&
+        wanted_caller(__builtin_return_address(0)) && !seen_too_often(fmt)) {
+        unsigned long v[8];
+        char line[480], piece[64];
+        int i, n = 0;
+        __builtin_va_list c;
+        __builtin_va_start(c, fmt);
+        for (i = 0; i < 8; i++) v[i] = __builtin_va_arg(c, unsigned long);
+        __builtin_va_end(c);
+        line[0] = 0;
+        if (grab_text(tag, piece, (int)sizeof piece)) {
+            s_cat(line, sizeof line, &n, piece);
+            s_cat(line, sizeof line, &n, " | ");
+        }
+        fmt_expand(line, (int)sizeof line, &n, fmt, v, 8);
+        count++;
+        log_line("alog   ", line, "");
+    }
+    if (real_v) {
+        __builtin_va_start(ap, fmt);
+        r = real_v(prio, tag, fmt, ap);
+        __builtin_va_end(ap);
+    }
+    return r;
 }

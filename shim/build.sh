@@ -51,7 +51,7 @@ emit_stub() {
 }
 
 emit_stub libdl.so  dlopen dlsym
-emit_stub liblog.so __android_log_print
+emit_stub liblog.so __android_log_vprint
 emit_stub libc.so   getenv memcpy memset usleep time pthread_create pipe fcntl fdopen
 
 # ---------------------------------------------------------------- the shim
@@ -62,6 +62,7 @@ cat > "$WORK/export.map" <<'EOF'
     mkdir; rmdir; unlink; remove; rename;
     utimes; statfs; system; strcasecmp;
     n200fs_note;
+    __android_log_print;
     _Z22NaviGetNaviSDCardStatev;
     _Z22mdGetFirstLayerOnStatev;
     _Z21NaviGetMapInitialDonev;
@@ -120,6 +121,7 @@ _Z28NaviGetUnloadNaviProcessFlagv
 _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
+__android_log_print
 access
 fopen
 mkdir
