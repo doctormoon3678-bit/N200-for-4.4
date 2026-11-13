@@ -85,8 +85,36 @@ int   __android_log_print(int, const char *, const char *, ...);
 #define O_TRUNC   00001000
 #define O_APPEND  00002000
 
-/* The root the app was built with. Left in place in the .so files on purpose:
- * it is the sentinel this library keys on. */
+/*
+ * The roots the app was built with. Left in place in the .so files on
+ * purpose: they are the sentinels this library keys on.
+ *
+ * /mnt/extSdCard is the one in the ELF strings, 288 times. The others only
+ * show up at runtime, which is why they were missed at first: the engine
+ * builds them from a root it gets elsewhere, and a device log caught it
+ * opening /storage/sdcard0/Navkingdom/Persistence/... and
+ * /storage/sdcard1/Navkingdom/Common/DB_MAP/map_version.ini. sdcard1 is the
+ * removable card, which on a Samsung is /storage/extSdCard, so every one of
+ * those reads failed.
+ *
+ * "Storage Card" is older still -- this engine began on Windows CE, and the
+ * backslash spellings below are in the binaries verbatim.
+ *
+ * need_nk limits the two /storage roots to paths under Navkingdom/, so a
+ * device where /storage/sdcard0 is real and holds something else is left
+ * alone.
+ */
+struct root { const char *p; int need_nk; };
+static const struct root ROOTS[] = {
+    { "/mnt/extSdCard",   0 },
+    { "/storage/sdcard0", 1 },
+    { "/storage/sdcard1", 1 },
+    { "/Storage Card2",   0 },
+    { "/Storage Card",    0 },
+    { 0, 0 }
+};
+
+/* The one that goes in the log banner and that system() rewrites. */
 static const char PFX[]  = "/mnt/extSdCard";
 #define PFX_LEN 14          /* strlen(PFX) */
 
@@ -539,7 +567,7 @@ static void pick_roots(void)
  */
 static void write_log(void)
 {
-    char path[PATHMAX], out[1024];
+    char path[PATHMAX], out[2048];
     int fd, n = 0;
 
     if (!r_open || !r_write) return;
@@ -776,29 +804,73 @@ void n200fs_note(const char *msg)
 static void log_fail(const char *what, const char *orig, const char *mapped)
 {
     static int count;
-    if (count >= 40) return;
+    if (count >= 150) return;
     count++;
     LOGE("%s FAILED: %s -> %s", what, orig, mapped);
     log_line("FAILED ", what, "");
     log_line("    asked for: ", orig, "");
     log_line("    looked at: ", mapped, "");
-    if (count == 40) {
+    if (count == 150) {
         LOGE("(further failure reports suppressed)");
         log_line("(further failure reports suppressed)", "", "");
     }
 }
 
-/* Does p start with the app's hard-coded root, as a whole path component? */
+static int is_sep(char c) { return c == '/' || c == '\\'; }
+
+/*
+ * Join a root to the remainder of a redirected path, turning backslashes into
+ * slashes on the way.
+ *
+ * On the system this engine was first written for they were separators; on
+ * Linux a backslash is an ordinary filename character, so
+ * "Common/DB_MAP\\map_version.ini" is one long filename and can never
+ * resolve. Normalising only ever applies to paths under a root the app
+ * hard-codes, so a real filename containing a backslash elsewhere is
+ * untouched.
+ */
+static int join_rest(char *buf, int cap, const char *root, const char *rest)
+{
+    int n = 0, i;
+    buf[0] = 0;
+    if (!s_cat(buf, cap, &n, root)) return 0;
+    if (rest[0]) {
+        if (!s_cat(buf, cap, &n, "/")) return 0;
+        for (i = 0; rest[i]; i++) {
+            if (n + 1 >= cap) return 0;
+            buf[n++] = is_sep(rest[i]) ? '/' : rest[i];
+        }
+        buf[n] = 0;
+    }
+    return 1;
+}
+
+/*
+ * Does p start with one of the app's hard-coded roots, as a whole path
+ * component? Separators compare equal either way round, because the Windows
+ * CE-era paths in these binaries are spelled with backslashes.
+ */
 static int strip_root(const char *p, const char **rest)
 {
-    const char *q = p;
-    if (!q) return 0;
-    if (s_ncmp(q, PFX, PFX_LEN) != 0) return 0;
-    q += PFX_LEN;
-    if (*q && *q != '/') return 0;      /* /mnt/extSdCardFoo is not ours */
-    while (*q == '/') q++;              /* the app writes /// a lot */
-    *rest = q;
-    return 1;
+    int i, k;
+    if (!p) return 0;
+    for (i = 0; ROOTS[i].p; i++) {
+        const char *r = ROOTS[i].p;
+        for (k = 0; r[k]; k++) {
+            if (is_sep(p[k]) && is_sep(r[k])) continue;
+            if (p[k] != r[k]) break;
+        }
+        if (r[k]) continue;                     /* did not match in full */
+        if (p[k] && !is_sep(p[k])) continue;    /* /mnt/extSdCardFoo is not ours */
+        {
+            const char *q = p + k;
+            while (is_sep(*q)) q++;             /* the app writes /// a lot */
+            if (ROOTS[i].need_nk && s_ncmp(q, "Navkingdom", 10) != 0) continue;
+            *rest = q;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -813,13 +885,15 @@ static const char *map_path(const char *p, int want_write, char *buf, int cap)
 {
     const char *rest;
     if (!p) return p;
-    if (s_ncmp(p, PFX, PFX_LEN) != 0) return p;   /* fast path */
+    /* The whole cost for a path that is none of ours: one compare per root,
+     * each bailing on the first character for anything that is not /mnt/... ,
+     * /storage/... or /Storage... */
+    if (!strip_root(p, &rest)) return p;
     resolve();
     if (!g_ready) return p;
-    if (!strip_root(p, &rest)) return p;
 
     if (want_write) {
-        if (!join(buf, cap, g_write, rest)) return p;
+        if (!join_rest(buf, cap, g_write, rest)) return p;
         make_parents(buf);
         return buf;
     }
@@ -845,15 +919,15 @@ static const char *map_path(const char *p, int want_write, char *buf, int cap)
         const char *first = is_state(rest) ? g_write : g_data;
         const char *second = (first == g_write) ? g_data : g_write;
 
-        if (!join(buf, cap, first, rest)) return p;
+        if (!join_rest(buf, cap, first, rest)) return p;
         if (r_access && r_access(buf, 0 /* F_OK */) == 0) return buf;
-        if (join(buf, cap, second, rest) &&
+        if (join_rest(buf, cap, second, rest) &&
             r_access && r_access(buf, 0) == 0)
             return buf;
         /* In neither root. Hand back the preferred one so the caller fails
          * with a sensible path; whether that failure matters is decided by
          * the caller, and logged there. */
-        if (!join(buf, cap, first, rest)) return p;
+        if (!join_rest(buf, cap, first, rest)) return p;
         return buf;
     }
 }

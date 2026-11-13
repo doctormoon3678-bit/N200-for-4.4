@@ -229,6 +229,32 @@ int main(int argc, char **argv)
            "  naming the file the app asked for");
     }
 
+    /* 9c. The other roots the engine builds at runtime, and the Windows CE
+     *     spellings in the binaries. Every path here is one a device log
+     *     caught the app opening and this library not redirecting. */
+    fd = n200_open("/storage/sdcard1/Navkingdom/Common/DB_MAP/NF60.sti", O_RDONLY, 0);
+    ck(fd >= 0, "/storage/sdcard1 is redirected to the card");
+    if (fd >= 0) close(fd);
+
+    f = n200_fopen("/storage/sdcard1/Navkingdom/Common/DB_MAP\\NF60.sti", "r");
+    ck(f != NULL, "  and a backslash in it is treated as a separator");
+    if (f) fclose(f);
+
+    f = n200_fopen("/storage/sdcard0/Navkingdom/Persistence/usermark.bak", "w");
+    ck(f != NULL, "/storage/sdcard0 Persistence writes are redirected");
+    if (f) { fputs("x", f); fclose(f); }
+    ck(exists("%s/Navkingdom/Persistence/usermark.bak", WRITE, 0),
+       "  and land in the write root, with everything else");
+
+    f = n200_fopen("\\Storage Card\\Navkingdom\\Navi\\CONF\\naviConfig_N200.txt", "r");
+    ck(f != NULL, "the Windows CE \"\\\\Storage Card\" spelling resolves too");
+    if (f) fclose(f);
+
+    /* A /storage/sdcard0 path that is NOT the app's data must be left alone,
+     * because on some devices that really is primary storage. */
+    ck(n200_fopen("/storage/sdcard0/DCIM/somebodys_photo.jpg", "r") == NULL,
+       "but /storage/sdcard0 outside Navkingdom is not touched");
+
     /* 10. paths that are not the app's root must be passed through untouched */
     f = n200_fopen("/etc/hostname", "r");
     ck(f != NULL, "an unrelated absolute path is not redirected");

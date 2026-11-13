@@ -226,6 +226,21 @@ maps the hard-coded root onto one that works:
 | read `/mnt/extSdCard///Navkingdom/Common/DB_MAP/x.sti` | → `<card>/Navkingdom/Common/DB_MAP/x.sti` |
 | write `/mnt/extSdCard///Navkingdom/LoggerServerPID` | → `/sdcard/n200dt/Navkingdom/LoggerServerPID` |
 
+`/mnt/extSdCard` is not the only root. It is the one in the ELF strings, 288
+times, but a device log caught the engine also opening
+`/storage/sdcard0/Navkingdom/Persistence/...` and
+`/storage/sdcard1/Navkingdom/Common/DB_MAP\map_version.ini` — built at
+runtime, so no amount of reading the binaries would have found them. `sdcard1`
+is the removable card, which on a Samsung is `/storage/extSdCard`, so every one
+of those reads was failing. `\Storage Card` and `\Storage Card2` are in the
+binaries verbatim, from this engine's Windows CE days.
+
+All of them are redirected now, and a backslash inside a redirected path is
+treated as a separator — on Linux it is an ordinary filename character, so
+`DB_MAP\map_version.ini` is one long filename and could never have resolved.
+The two `/storage` roots only apply under `Navkingdom/`, so a device where
+`/storage/sdcard0` really is primary storage keeps the rest of it.
+
 Three things make this better than rewriting the strings, beyond lifting the
 14-byte limit:
 
