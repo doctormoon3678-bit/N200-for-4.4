@@ -14,9 +14,16 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CC="${CC:-cc}"
+SAN=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --cc) CC="$2"; shift 2 ;;
+        # Buffer handling in here is all hand-rolled against fixed-size stack
+        # arrays, and a stray byte on a phone shows up as a force-close with
+        # nothing useful in logcat. Run the same scenarios under the
+        # sanitizers so it shows up here instead.
+        --sanitize) SAN="-fsanitize=address,undefined -fno-omit-frame-pointer"
+                    shift ;;
         -h|--help) sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
@@ -33,13 +40,16 @@ done
 
 echo "==> building the host self-test"
 # shellcheck disable=SC2086
-"$CC" -std=gnu99 -g -O0 -Wall -Wextra -Wno-unused-parameter \
+# shellcheck disable=SC2086
+"$CC" -std=gnu99 -g -O1 -Wall -Wextra -Wno-unused-parameter $SAN \
       -DN200FS_LIBC='"libc.so.6"' -DRTLD_NOW=2 -DRTLD_DEFAULT=0 \
       $RENAME \
       -c "$HERE/n200fs.c" -o "$WORK/n200fs.o"
-"$CC" -std=gnu99 -g -O0 -Wall -Wextra -include stdarg.h \
+# shellcheck disable=SC2086
+"$CC" -std=gnu99 -g -O1 -Wall -Wextra -include stdarg.h $SAN \
       -c "$HERE/test_paths.c" -o "$WORK/test_paths.o"
-"$CC" "$WORK/n200fs.o" "$WORK/test_paths.o" -ldl -o "$WORK/test_paths"
+# shellcheck disable=SC2086
+"$CC" $SAN "$WORK/n200fs.o" "$WORK/test_paths.o" -ldl -o "$WORK/test_paths"
 
 run() {                      # run <label> <card-dir> <primary-dir>
     local label="$1" card="$2" primary="$3"
@@ -93,6 +103,60 @@ else
     echo "  skip  cannot bind-mount here"
     echo
     rmdir "$MP" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 1c. The regression that mattered. KitKat mounts primary storage under
+#     several names at once and EXTERNAL_STORAGE names only one, so a search
+#     for "not primary storage" used to pick internal storage under a second
+#     name, find the n200dt tree an older build left there, and use that as
+#     the card -- often a half-deleted copy, which then crashes the app on the
+#     first missing file. The card must win.
+CARDMP=/mnt/weird_card_xyz
+ALIAS=/storage/emulated/0
+# The leftover is mounted FIRST, because that is the order a phone has it in:
+# internal storage comes up at boot, the card later. /proc/mounts is in mount
+# order, so a search that takes the first match it finds takes the leftover --
+# which is what used to happen, and why this test would pass by accident if
+# the two were mounted the other way round.
+if mkdir -p "$CARDMP" "$ALIAS" 2>/dev/null &&
+   mkdir -p "$WORK/card2" "$WORK/leftover/n200dt/Navkingdom/Navi" &&
+   mount --bind "$WORK/leftover" "$ALIAS" 2>/dev/null &&
+   mount --bind "$WORK/card2" "$CARDMP" 2>/dev/null; then
+    fixture "$CARDMP"
+    # The leftover is deliberately incomplete, exactly as it would be on a
+    # phone that ran out of room: a Navkingdom with a Navi/ but no map.
+    mkdir -p "$WORK/primary1c"
+    run "card beats a leftover tree on a primary-storage alias" \
+        "$CARDMP" "$WORK/primary1c" || rc=1
+    umount "$ALIAS" 2>/dev/null || true
+    umount "$CARDMP" 2>/dev/null || true
+    rmdir "$CARDMP" 2>/dev/null || true
+else
+    echo "== card beats a leftover tree on a primary-storage alias"
+    echo "  skip  cannot bind-mount here"
+    echo
+    umount "$ALIAS" 2>/dev/null || true
+    umount "$CARDMP" 2>/dev/null || true
+    rmdir "$CARDMP" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 1d. A directory called Navkingdom that holds neither Navi/ nor Common/ is
+#     not a map tree. Latching onto one means every read misses, fopen returns
+#     NULL and the app dereferences it -- the original crash.
+if mkdir -p "$CARDMP" 2>/dev/null &&
+   mkdir -p "$WORK/decoy/Navkingdom" "$WORK/primary1d/n200dt" &&
+   mount --bind "$WORK/decoy" "$CARDMP" 2>/dev/null; then
+    fixture "$WORK/primary1d/n200dt"
+    run "an empty Navkingdom is not mistaken for the map tree" \
+        "$WORK/primary1d/n200dt" "$WORK/primary1d" || rc=1
+    umount "$CARDMP" 2>/dev/null || true
+    rmdir "$CARDMP" 2>/dev/null || true
+else
+    echo "== an empty Navkingdom is not mistaken for the map tree"
+    echo "  skip  cannot bind-mount here"
+    echo
 fi
 
 # ---------------------------------------------------------------------------

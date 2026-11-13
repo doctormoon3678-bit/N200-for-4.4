@@ -208,12 +208,37 @@ Three things make this better than rewriting the strings, beyond lifting the
   guessed names has to be right. A list of known names is still tried
   afterwards, because a card reached through a *symlink* is not a mount and
   does not appear there.
+
+  Two things make that search harder than it sounds, and both have bitten:
+  KitKat mounts primary storage under **several** names at once
+  (`/storage/emulated/0`, `/storage/emulated/legacy`, `/mnt/shell/emulated/0`,
+  `/storage/sdcard0`) while `EXTERNAL_STORAGE` names only one, so "anything
+  that is not primary storage" has to mean all of them; and a `Navkingdom`
+  left on internal storage by an earlier install is usually *incomplete* —
+  running out of room there is what sends people to a card — so every mount is
+  searched for a card-shaped tree before any is searched for the internal
+  layout, and a `Navkingdom` holding neither `Navi/` nor `Common/` is not
+  accepted at all.
 * **Missing write directories are created on demand.** The app assumes its tree
   already exists and never calls `mkdir` for most of it.
 
-Reads are an overlay: the write root is consulted first, so state the app has
-written wins over the pristine copy on the card, and the card is never written
-to.
+Reads look in both roots, and which one is preferred depends on what the file
+is:
+
+* **`Navkingdom/Persistence/`** — the app's own mutable state, ~120 `.bak` and
+  `.dat` files it writes and reads back. The write root wins, or settings and
+  saved routes would reset at every start.
+* **everything else** — `Common/`, `Navi/`, `manual/`: read-only payload. The
+  **card** wins, even if a stale copy is still sitting on internal storage from
+  an earlier install. Preferring the write root here is what makes a
+  half-deleted leftover tree shadow the real map data.
+
+The card itself is never written to.
+
+A read that finds the file in neither root is logged by name. The app does not
+check `fopen`'s result, so a missing file becomes a SIGSEGV inside `fprintf`
+with nothing to say which file was wanted — that is the tombstone this project
+started from, and this turns it into a line in `n200fs.log`.
 
 ```sh
 # put the original APK here (it is gitignored)
@@ -535,13 +560,22 @@ Checked directly:
 * The redirection logic is **run, not just inspected**. `shim/selftest.sh`
   compiles `shim/n200fs.c` natively — the same source, nothing stubbed out,
   including its load-time constructor — and exercises it against the host's
-  libc in three scenarios: card auto-detected from the built-in mount-point
-  list, card named by `n200fs.conf`, and no card at all. It checks that a map
+  libc in six scenarios: card auto-detected from the built-in mount-point
+  list; card found through `/proc/mounts` at a path deliberately *absent* from
+  that list, so the mount-table search is what passes it and not the fallback;
+  a card competing with an incomplete leftover tree on a second name for
+  primary storage, mounted first as a phone would have it; a decoy
+  `Navkingdom` holding neither `Navi/` nor `Common/`; a card named by
+  `n200fs.conf`; and no card at all. It checks that a map
   read reaches the card, that `fopen(..., "w")` on a path whose directory does
   not exist still returns a stream (the tombstone case) and lands on primary
-  storage, that the card is never written to, that a written file shadows the
-  card copy on read, that `system()` has the root rewritten inside the command
-  text, and that an unrelated path is passed through untouched.
+  storage, that the card is never written to, that written `Persistence` state
+  is read back while `Navkingdom/Navi` still comes from the card even with a
+  stale copy in the write root, that `system()` has the root rewritten inside
+  the command text, and that an unrelated path is passed through untouched.
+  `--sanitize` reruns the lot under ASan and UBSan, because the buffer
+  handling is hand-rolled against fixed-size stack arrays and a stray byte on
+  a phone is a force-close with nothing in logcat.
 * The built library is ELF32 / DYN / ARM, SONAME `libn200fs.so`, 12 KB,
   depending on nothing but libc, libdl and liblog, importing four symbols and
   exporting **exactly** the 13 it interposes. An extra export would be bound by

@@ -48,9 +48,12 @@ jobs:
       - name: DT_NEEDED injection
         run: python3 tools/test_inject.py
 
-      # The redirection logic, run for real against glibc.
+      # The redirection logic, run for real against glibc, under the
+      # sanitizers: the buffer handling is hand-rolled against fixed-size
+      # stack arrays and a stray byte on a phone is a force-close with
+      # nothing in logcat to go on.
       - name: Redirection self-test
-        run: shim/selftest.sh
+        run: shim/selftest.sh --sanitize
 
       - name: Build for ARM
         run: shim/build.sh

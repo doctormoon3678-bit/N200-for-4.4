@@ -314,23 +314,77 @@ static void read_conf(const char *path)
     s_trim(g_write);
 }
 
-/* Does <root>/Navkingdom exist, or <root>/n200dt/Navkingdom? Returns 1 and
- * fills g_data on a hit. */
-static int try_root(const char *root)
+/*
+ * Is this a real map tree, or just a directory that happens to be called
+ * Navkingdom?
+ *
+ * The difference matters more than it looks. Latching onto an empty or
+ * half-deleted Navkingdom means every read resolves to a file that is not
+ * there, fopen returns NULL, and the app -- which never checks -- dereferences
+ * it. That is the exact crash this whole project exists to fix, so the test
+ * asks for the two directories the engine cannot start without.
+ */
+static int tree_ok(const char *nk)
 {
     char buf[PATHMAX];
+    if (join(buf, sizeof buf, nk, "Navi") && is_dir(buf)) return 1;
+    if (join(buf, sizeof buf, nk, "Common") && is_dir(buf)) return 1;
+    return 0;
+}
+
+/*
+ * layout 0: <root>/Navkingdom          -- a card, prepared by hand
+ * layout 1: <root>/n200dt/Navkingdom   -- what older repacks of this APK told
+ *                                         people to create on INTERNAL storage
+ *
+ * The two are searched in separate passes, never together, because a leftover
+ * layout-1 tree on internal storage must never be mistaken for a card.
+ */
+static int try_root(const char *root, int layout)
+{
+    char buf[PATHMAX];
+    char cand[PATHMAX];
+    int n = 0;
+
     if (!root || !root[0]) return 0;
-    if (join(buf, sizeof buf, root, "Navkingdom") && is_dir(buf)) {
-        s_copy(g_data, sizeof g_data, root);
-        return 1;
+    cand[0] = 0;
+    if (!s_cat(cand, sizeof cand, &n, root)) return 0;
+    if (layout == 1 && !s_cat(cand, sizeof cand, &n, "/n200dt")) return 0;
+    if (!join(buf, sizeof buf, cand, "Navkingdom")) return 0;
+    if (!is_dir(buf)) return 0;
+    if (!tree_ok(buf)) {
+        LOGI("%s exists but holds no Navi/ or Common/; ignoring it", buf);
+        return 0;
     }
-    if (join(buf, sizeof buf, root, "n200dt/Navkingdom") && is_dir(buf)) {
-        int n = 0;
-        g_data[0] = 0;
-        s_cat(g_data, sizeof g_data, &n, root);
-        s_cat(g_data, sizeof g_data, &n, "/n200dt");
+    s_copy(g_data, sizeof g_data, cand);
+    return 1;
+}
+
+/*
+ * Every name primary storage answers to.
+ *
+ * KitKat mounts the built-in storage at several paths at once --
+ * /storage/emulated/0, /storage/emulated/legacy, /mnt/shell/emulated/0,
+ * /storage/sdcard0 -- and EXTERNAL_STORAGE names only one of them. Comparing
+ * against that one variable is not enough: the others look like separate
+ * filesystems in /proc/mounts, so a search for "anything that is not primary
+ * storage" happily picks internal storage under a second name, finds the
+ * leftover n200dt tree there, and calls it the card.
+ */
+static int is_primary_alias(const char *mp, const char *primary)
+{
+    static const char *const P[] = {
+        "/sdcard", "/mnt/sdcard", "/storage/sdcard0", "/storage/self/primary", 0
+    };
+    int i;
+    if (s_ncmp(mp, primary, s_len(primary)) == 0 &&
+        s_len(mp) == s_len(primary))
         return 1;
-    }
+    if (s_ncmp(mp, "/storage/emulated", 17) == 0) return 1;
+    if (s_ncmp(mp, "/mnt/shell/emulated", 19) == 0) return 1;
+    for (i = 0; P[i]; i++)
+        if (s_ncmp(mp, P[i], s_len(P[i])) == 0 && s_len(mp) == s_len(P[i]))
+            return 1;
     return 0;
 }
 
@@ -349,7 +403,7 @@ static int try_root(const char *root)
  * Mount points are also logged, because when this fails they are the one thing
  * needed to say why.
  */
-static int scan_mounts(const char *primary, int probe)
+static int scan_mounts(const char *primary, int probe, int layout)
 {
     char buf[8192];
     int listn = 0;
@@ -364,9 +418,9 @@ static int scan_mounts(const char *primary, int probe)
     }
     g_mounts[0] = 0;
 
-    /* Pass 0 takes anything that is not primary storage, so a card wins over
-     * the built-in storage even when both carry a Navkingdom. Pass 1 then
-     * allows primary. */
+    /* Pass 0 takes anything that is not primary storage under any of its
+     * names, so a card wins over the built-in storage even when both carry a
+     * Navkingdom. Pass 1 then allows primary. */
     for (pass = 0; pass < 2 && !found; pass++) {
         int start = 0;
         for (i = 0; i <= n; i++) {
@@ -392,15 +446,14 @@ static int scan_mounts(const char *primary, int probe)
             /* Only storage-shaped mount points are worth a syscall. */
             if (s_ncmp(mp, "/storage", 8) != 0 && s_ncmp(mp, "/mnt", 4) != 0)
                 continue;
-            if (pass == 0 && s_ncmp(mp, primary, s_len(primary)) == 0 &&
-                s_len(mp) == s_len(primary))
+            if (pass == 0 && is_primary_alias(mp, primary))
                 continue;
 
             if (pass == 0 && listn + k + 2 < (int)sizeof g_mounts) {
                 if (listn) s_cat(g_mounts, sizeof g_mounts, &listn, " ");
                 s_cat(g_mounts, sizeof g_mounts, &listn, mp);
             }
-            if (probe && try_root(mp)) {
+            if (probe && try_root(mp, layout)) {
                 found = 1;
                 break;
             }
@@ -433,25 +486,38 @@ static void pick_roots(void)
     make_parents(g_write);
     if (r_mkdir) r_mkdir(g_write, 0775);
 
-    if (g_data[0]) {                /* set from n200fs.conf */
-        scan_mounts(primary, 0);    /* collect the list for the log only */
+    if (g_data[0]) {                     /* set from n200fs.conf */
+        scan_mounts(primary, 0, 0);      /* collect the list for the log only */
         if (join(buf, sizeof buf, g_data, "Navkingdom") && !is_dir(buf))
             LOGE("n200fs.conf says data=%s but %s is not a directory",
                  g_data, buf);
         return;
     }
 
-    /* The mount table knows what is actually mounted, whatever it is called. */
-    if (scan_mounts(primary, 1)) return;
-
-    /* Then the known names, which also catch a card reached through a symlink
-     * -- those are not mounts and are not in /proc/mounts. */
+    /*
+     * Order matters, and the reason is the whole point of this mode.
+     *
+     * A card prepared by hand holds <card>/Navkingdom. Internal storage, on a
+     * phone that ran an older build of this repack, holds
+     * /sdcard/n200dt/Navkingdom -- very often an incomplete copy, since
+     * running out of room there is what sent people to a card in the first
+     * place. Searching both layouts together lets that leftover win on a
+     * device where primary storage is mounted under a second name, and then
+     * every read resolves into a half-populated tree.
+     *
+     * So: real cards first, in both layouts, and only then internal storage.
+     */
+    if (scan_mounts(primary, 1, 0)) return;       /* <card>/Navkingdom      */
+    for (i = 0; CANDIDATES[i]; i++)               /* symlinked cards, which */
+        if (try_root(CANDIDATES[i], 0)) return;   /* are not mounts         */
+    if (scan_mounts(primary, 1, 1)) return;       /* <card>/n200dt/...      */
     for (i = 0; CANDIDATES[i]; i++)
-        if (try_root(CANDIDATES[i])) return;
+        if (try_root(CANDIDATES[i], 1)) return;
 
     /* Nothing on a card: fall back to primary storage, which is what a build
      * without this library would have used anyway. */
-    if (try_root(primary)) return;
+    if (try_root(primary, 0)) return;
+    if (try_root(primary, 1)) return;
 
     LOGE("no Navkingdom directory found on any mounted storage.");
     LOGE("Put the map tree at <card>/Navkingdom, or name the card yourself:");
@@ -543,6 +609,47 @@ static void resolve(void)
 
 /* ---- path mapping ------------------------------------------------------ */
 
+/* Is this path the app's own mutable state rather than read-only payload?
+ * Persistence/ is the whole of it: the app reads these back after writing
+ * them, so a read has to see the copy it wrote. */
+static int is_state(const char *rest)
+{
+    if (s_ncmp(rest, "Navkingdom/Persistence", 22) == 0) return 1;
+    if (s_ncmp(rest, "Persistence", 11) == 0) return 1;
+    return 0;
+}
+
+/*
+ * Record a read that found nothing in either root.
+ *
+ * This is the single most useful thing this library can report. The app does
+ * not check fopen's result, so a missing file becomes a SIGSEGV inside
+ * fprintf with nothing in the log to say which file was wanted -- which is
+ * the tombstone this project started from. Appending the path here turns a
+ * force-close into a named missing file.
+ */
+static void log_miss(const char *path)
+{
+    static int count;
+    char p[PATHMAX];
+    int fd;
+
+    if (count >= 40) return;
+    count++;
+    LOGE("not found in either root: %s", path);
+    if (!r_open || !r_write || !g_write[0]) return;
+    if (!join(p, sizeof p, g_write, "n200fs.log")) return;
+    /* O_WRONLY|O_CREAT|O_APPEND */
+    fd = r_open(p, 1 | 0100 | 02000, 0644);
+    if (fd < 0) return;
+    r_write(fd, "missing: ", 9);
+    r_write(fd, path, (u32)s_len(path));
+    r_write(fd, "\n", 1);
+    if (r_close) r_close(fd);
+    if (count == 40)
+        LOGE("(further missing-file reports suppressed)");
+}
+
 /* Does p start with the app's hard-coded root, as a whole path component? */
 static int strip_root(const char *p, const char **rest)
 {
@@ -578,10 +685,40 @@ static const char *map_path(const char *p, int want_write, char *buf, int cap)
         make_parents(buf);
         return buf;
     }
-    if (!join(buf, cap, g_write, rest)) return p;
-    if (r_access && r_access(buf, 0 /* F_OK */) == 0) return buf;
-    if (!join(buf, cap, g_data, rest)) return p;
-    return buf;
+
+    /*
+     * Which root a read prefers.
+     *
+     * Persistence/ is the app's own mutable state -- the ~120 .bak and .dat
+     * files it writes and reads back -- so there the copy it wrote has to win
+     * over whatever the card shipped with, or settings and saved routes would
+     * silently reset every start.
+     *
+     * Everything else is read-only payload: Common/, Navi/, manual/. Those
+     * must come from the card even when a stale copy is still sitting on
+     * internal storage from an earlier, internal-only install. Preferring the
+     * write root for those is what makes a half-deleted leftover tree shadow
+     * the real data.
+     *
+     * Either way the other root is still tried, so a file present in only one
+     * place is found wherever it is.
+     */
+    {
+        const char *first = is_state(rest) ? g_write : g_data;
+        const char *second = (first == g_write) ? g_data : g_write;
+
+        if (!join(buf, cap, first, rest)) return p;
+        if (r_access && r_access(buf, 0 /* F_OK */) == 0) return buf;
+        if (join(buf, cap, second, rest) &&
+            r_access && r_access(buf, 0) == 0)
+            return buf;
+        /* In neither root. The app does not check for that and will crash on
+         * the NULL it gets back, so say which file it was while we still
+         * know. */
+        log_miss(p);
+        if (!join(buf, cap, first, rest)) return p;
+        return buf;
+    }
 }
 
 /* ---- the interposed entry points --------------------------------------- */

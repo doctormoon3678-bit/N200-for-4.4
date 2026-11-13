@@ -23,6 +23,7 @@ int   n200_open(const char *, int, ...);
 int   n200_stat(const char *, void *);
 int   n200_access(const char *, int);
 void *n200_opendir(const char *);
+int   closedir(void *);
 int   n200_mkdir(const char *, unsigned);
 int   n200_unlink(const char *);
 int   n200_rename(const char *, const char *);
@@ -124,13 +125,31 @@ int main(int argc, char **argv)
     ck(f != NULL, "fopen() three directories deep creates the parents");
     if (f) { fputs("x", f); fclose(f); }
 
-    /* 4. overlay: once written, a read finds the written copy, not the card's */
-    f = n200_fopen("/mnt/extSdCard///Navkingdom/Common/DB_MAP/NF60.sti", "w");
-    if (f) { fputs("LOCAL", f); fclose(f); }
-    f = n200_fopen("/mnt/extSdCard///Navkingdom/Common/DB_MAP/NF60.sti", "r");
+    /* 4. State the app wrote must win over whatever the card shipped, or
+     *    settings and saved routes would reset at every start. */
+    f = n200_fopen("/mnt/extSdCard///Navkingdom/Persistence/HMI_Persistence.bak", "w");
+    if (f) { fputs("MYSTATE", f); fclose(f); }
+    f = n200_fopen("/mnt/extSdCard///Navkingdom/Persistence/HMI_Persistence.bak", "r");
     buf[0] = 0;
     if (f) { size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f); }
-    ck(strcmp(buf, "LOCAL") == 0, "a written file shadows the card copy on read");
+    ck(strcmp(buf, "MYSTATE") == 0, "written Persistence state is read back");
+
+    /* 5. ...but read-only payload must come from the card even when a stale
+     *    copy is sitting in the write root. This is the case that made a
+     *    leftover internal tree shadow the real map data. */
+    if (!same_root) {
+        snprintf(buf, sizeof buf, "%s/Navkingdom/Navi/CONF", WRITE);
+        n200_mkdir("/mnt/extSdCard///Navkingdom/Navi/CONF", 0775);
+        snprintf(buf, sizeof buf, "%s/Navkingdom/Navi/CONF/naviConfig_N200.txt", WRITE);
+        { FILE *s = fopen(buf, "w"); if (s) { fputs("STALE", s); fclose(s); } }
+        f = n200_fopen("/mnt/extSdCard///Navkingdom/Navi/CONF/naviConfig_N200.txt", "r");
+        buf[0] = 0;
+        if (f) { size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f); }
+        ck(strcmp(buf, "cfg") == 0,
+           "Navkingdom/Navi comes from the card, not a stale internal copy");
+    } else {
+        ck_split(0, "Navkingdom/Navi comes from the card, not a stale copy");
+    }
     ck_split(slurp(
         (snprintf(buf, sizeof buf, "%s/Navkingdom/Common/DB_MAP/NF60.sti", CARD),
          buf), buf, sizeof buf) >= 0 && strcmp(buf, "MAPDATA") == 0,
@@ -154,8 +173,11 @@ int main(int argc, char **argv)
        "mkdir() creates under the write root");
     ck(n200_access("/mnt/extSdCard///Navkingdom/Common/DB_MAP/NF60.sti", F_OK) == 0,
        "access(F_OK) resolves through the overlay");
-    ck(n200_opendir("/mnt/extSdCard///Navkingdom") != NULL,
-       "opendir() resolves");
+    {
+        void *dir = n200_opendir("/mnt/extSdCard///Navkingdom");
+        ck(dir != NULL, "opendir() resolves");
+        if (dir) closedir(dir);
+    }
     ck(n200_stat("/mnt/extSdCard///Navkingdom/Navi/CONF/naviConfig_N200.txt",
                  (void *)buf) == 0,
        "stat() resolves to the card");
