@@ -222,15 +222,36 @@ Checked directly, against the real APK:
 * Substituting the stub removes all 152 private symbols and all 20 private
   library dependencies, and clears every RISK from the load sequence.
 
+Confirmed by an actual ARM build in CI (run 2, NDK r21e):
+
+* The library really is `ELF32 / DYN / Machine: ARM`, built `Tag_CPU_arch: v7`,
+  `Tag_FP_arch: VFPv3` — matching the app's own libraries — with SONAME
+  `libstagefright_dmb.so` and `DT_NEEDED` of only libdl, liblog, libc, libm and
+  libstdc++. 13904 bytes against the original's 2349248.
+* All four gates pass on each of the three variants: required symbols present,
+  no unexpected exports, SONAME intact, NDK-stable dependencies only.
+* The first CI build earned its keep: it caught the stub re-exporting the
+  statically linked libunwind (`_Unwind_*`, `__aeabi_unwind_cpp_pr0/1/2`,
+  `unw_*`). Because the KitKat linker searches the requesting library's own
+  `DT_NEEDED` list first, and three of the app's libraries list
+  `libstagefright_dmb.so`, they would have bound their unwinder to the stub's
+  copy instead of libgnustl_shared.so's — breaking exception handling in the
+  navigation engine. `stub/jni/stub.map` now pins the exported set to exactly
+  the 16 symbols (plus the two C2 aliases), and both build gates fail on any
+  stray export. The host check applies the same version script, so it would
+  catch a regression without an NDK.
+
 Not verified, and honestly so:
 
 * **Nothing has run on a device.** The conclusion that the original APK fails at
   load #10 is inferred from its dependency graph, not observed in a logcat. The
   logcat command above settles it; `cannot locate symbol "_ZN7android…"
   referenced by "libstagefright_dmb.so"` confirms it.
-* **The stub has never been compiled for ARM here** — this environment has no
-  NDK and no network to fetch one. `stub/build.sh` and `tools/verify_abi.py` are
-  the gates that confirm it on your machine.
+* **No repack has been done with the CI-built ARM stub.** The repack pipeline
+  was exercised end to end with the original library in place (`--keep-dmb`),
+  and the ABI end state was measured by substituting a host build, but the two
+  halves have not been put together in one run. Doing that is the first thing
+  `tools/repack.sh --strip-dead` will tell you.
 * Whether the navigation engine tolerates a silent TTS sink. See the tracing
   build above.
 
