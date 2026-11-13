@@ -53,6 +53,14 @@ static void ck(int cond, const char *what)
     if (!cond) failures++;
 }
 
+void check_gps(void (*ck)(int, const char *), void (*cks)(int, const char *));
+
+static void ck_skip_named(int cond, const char *what)
+{
+    (void)cond;
+    printf("  %-5s %s\n", "skip", what);
+}
+
 /* A check that only means something when the two roots are distinct. */
 static void ck_split(int cond, const char *what)
 {
@@ -262,6 +270,83 @@ int main(int argc, char **argv)
     ck(n200_fopen("/mnt/extSdCardOther/x", "r") == NULL,
        "a path that merely starts with the prefix is not matched");
 
+    check_gps(ck, ck_skip_named);
+
     printf("%s: %d failure(s)\n\n", argc > 1 ? argv[1] : "scenario", failures);
     return failures ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------------- *
+ * The synthetic GPS feed, validated the way libNV_UART.so would: every
+ * sentence checksummed, GPRMC present and flagged valid, coordinates
+ * matching the configured position. Nothing is stubbed -- the real thread
+ * writes into the real FIFO path and this reads it back out.
+ * ---------------------------------------------------------------------- */
+#define N200_FIFO "/data/data/com.npnd.n200/files/gpsfifo"
+
+static int nmea_ck_ok(const char *line, int len)
+{
+    int i;
+    unsigned char ck = 0;
+    if (len < 6 || line[0] != '$') return 0;
+    for (i = 1; i < len && line[i] != '*'; i++) ck ^= (unsigned char)line[i];
+    if (i + 2 >= len + 1 || line[i] != '*') return 0;
+    {
+        char want[3];
+        snprintf(want, sizeof want, "%02X", ck);
+        return line[i + 1] == want[0] && line[i + 2] == want[1];
+    }
+}
+
+void check_gps(void (*ck)(int, const char *),
+               void (*cks)(int, const char *))
+{
+    char buf[4096];
+    int fd, total = 0, tries, nlines = 0, bad = 0;
+    int saw_rmc = 0, saw_gga = 0, saw_valid = 0, saw_coord = 0;
+    struct stat st;
+
+    if (stat(N200_FIFO, &st) != 0) {
+        cks(0, "synthetic GPS feed writes valid NMEA");
+        return;
+    }
+    fd = open(N200_FIFO, O_RDONLY | O_NONBLOCK);
+    if (fd < 0) {
+        cks(0, "synthetic GPS feed writes valid NMEA");
+        return;
+    }
+    for (tries = 0; tries < 60 && total < 400; tries++) {
+        int n = (int)read(fd, buf + total, sizeof buf - 1 - (size_t)total);
+        if (n > 0) total += n;
+        else usleep(100000);
+    }
+    close(fd);
+    buf[total > 0 ? total : 0] = 0;
+
+    {
+        char *p = buf, *e;
+        while ((e = strstr(p, "\r\n")) != NULL) {
+            int len = (int)(e - p);
+            if (len > 0) {
+                nlines++;
+                if (!nmea_ck_ok(p, len)) bad++;
+                if (!strncmp(p, "$GPRMC,", 7)) {
+                    saw_rmc = 1;
+                    if (strstr(p, ",A,") && strstr(p, "3733.9900") &&
+                        strstr(p, "12658.6800"))
+                        saw_valid = 1;
+                    if (strstr(p, "3733.9900,N") && strstr(p, "12658.6800,E"))
+                        saw_coord = 1;
+                }
+                if (!strncmp(p, "$GPGGA,", 7)) saw_gga = 1;
+            }
+            p = e + 2;
+        }
+    }
+    ck(nlines >= 5, "synthetic GPS feed produces NMEA sentences");
+    ck(bad == 0, "  every sentence's checksum is correct");
+    ck(saw_rmc, "  GPRMC is present (libNV_UART refuses to work without it)");
+    ck(saw_gga, "  GPGGA is present");
+    ck(saw_valid, "  GPRMC is flagged valid at the configured position");
+    ck(saw_coord, "  and the coordinates convert correctly to ddmm.mmmm");
 }

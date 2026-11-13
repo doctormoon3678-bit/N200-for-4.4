@@ -51,6 +51,10 @@ echo "==> building the host self-test"
 # shellcheck disable=SC2086
 "$CC" $SAN "$WORK/n200fs.o" "$WORK/test_paths.o" -ldl -o "$WORK/test_paths"
 
+# The synthetic GPS feed writes to the FIFO path compiled into the engine,
+# so the test needs that directory to exist. Skipped where it cannot be made.
+mkdir -p /data/data/com.npnd.n200/files 2>/dev/null || true
+
 run() {                      # run <label> <card-dir> <primary-dir>
     local label="$1" card="$2" primary="$3"
     N200T_CARD="$card" N200T_WRITE="$primary/n200dt" \

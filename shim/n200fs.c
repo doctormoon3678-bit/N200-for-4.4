@@ -79,6 +79,10 @@ int   __android_log_print(int, const char *, const char *, ...);
 #define LOGI(...) __android_log_print(4, "n200fs", __VA_ARGS__)
 #define LOGE(...) __android_log_print(6, "n200fs", __VA_ARGS__)
 
+/* Defined at the end of the file, used before it. */
+static void gps_start(void);
+static int  parse_gps(const char *v);
+
 /* open(2) flags. Generic Linux values; identical on every Android ARM ABI. */
 #define O_ACCMODE 00000003
 #define O_CREAT   00000100
@@ -342,6 +346,8 @@ static void read_conf(const char *path)
                     s_copy(g_write, sizeof g_write, line + 6);
                 else if (s_ncmp(line, "enginelog=", 10) == 0)
                     g_enginelog = line[10] != '0';
+                else if (s_ncmp(line, "gps=", 4) == 0)
+                    parse_gps(line + 4);
             }
         }
         start = i + 1;
@@ -726,6 +732,9 @@ static void resolve(void)
 
     g_ready = 1;
     g_busy = 0;
+
+    /* Last, so the roots and the log banner are in place first. */
+    gps_start();
 }
 
 /* ---- path mapping ------------------------------------------------------ */
@@ -1215,4 +1224,273 @@ __attribute__((constructor))
 static void n200fs_init(void)
 {
     resolve();
+}
+
+/* ====================================================================== *
+ *  Synthetic GPS
+ *
+ *  WHY
+ *  ---
+ *  The engine will not leave its "preparing navigation" screen until the
+ *  position module has a fix. Its own log makes that plain: 1170 identical
+ *  lines of "[PREDICT_LOG] 0 0 0 0 1 0 0" -- the dead-reckoning loop running
+ *  on all-zero input.
+ *
+ *  Position reaches it as raw NMEA through a FIFO:
+ *
+ *      Android GPS -> GpsBridge (Java) -> /data/data/<pkg>/files/gpsfifo
+ *                  -> libNV_UART.so -> libNV_POS.so
+ *
+ *  GpsBridge forwards onNmeaReceived() only -- its onLocationChanged() is an
+ *  empty method -- so a mock-location app cannot drive this: mock providers
+ *  deliver Location objects, never NMEA. Indoors, with no real fix, nothing is
+ *  ever written and the app cannot start at all.
+ *
+ *  So write the NMEA here instead. libn200fs.so is already in the process, and
+ *  a FIFO does not care which thread fills it.
+ *
+ *  WHAT libNV_UART.so REQUIRES
+ *  ---------------------------
+ *  Two of its own messages set the rules:
+ *      "NMEA Data Read Fail because of no GPRMC Message"  -- GPRMC is required
+ *      "NMEA checksum err: %s"                            -- checksums are checked
+ *  It also parses GPGGA, GPGSA, GPGSV and GPVTG, so a full stationary burst is
+ *  sent rather than the bare minimum.
+ *
+ *  NO FLOATING POINT
+ *  -----------------
+ *  This library links -nostdlib, so there is no libgcc and no soft-float
+ *  support code to call. Coordinates are held in microdegrees and formatted
+ *  with integer arithmetic throughout; every divisor is a compile-time
+ *  constant, so the compiler turns them into multiplies rather than calls to
+ *  __aeabi_idiv. The build gate fails on any unexpected import, which is what
+ *  keeps that honest.
+ * ====================================================================== */
+
+#define FIFO_PATH "/data/data/com.npnd.n200/files/gpsfifo"
+
+static int  (*r_mkfifo)(const char *, u32);
+static int  (*r_usleep)(u32);
+static long (*r_time)(void *);
+static int  (*r_pthread_create)(void *, const void *, void *(*)(void *), void *);
+
+static int g_gps = 1;                 /* inject unless told otherwise */
+static int g_lat = 37566500;          /* microdegrees; Seoul City Hall */
+static int g_lon = 126978000;
+
+/* ---- integer formatting ------------------------------------------------ */
+
+static void put_u(char *b, int *n, int cap, unsigned v, int digits)
+{
+    char t[12];
+    int k = 0;
+    if (!digits) {                       /* natural width */
+        if (!v) t[k++] = '0';
+        while (v) { t[k++] = (char)('0' + v % 10); v /= 10; }
+    } else {
+        while (digits--) { t[k++] = (char)('0' + v % 10); v /= 10; }
+    }
+    while (k-- > 0) {
+        if (*n + 1 >= cap) return;
+        b[(*n)++] = t[k];
+    }
+    b[*n] = 0;
+}
+
+/* 37566500 -> "3733.9900" : degrees, then minutes to four decimals. */
+static void put_coord(char *b, int *n, int cap, int udeg, int degdigits)
+{
+    unsigned a = (unsigned)(udeg < 0 ? -udeg : udeg);
+    unsigned deg = a / 1000000u;
+    unsigned min_e4 = (a % 1000000u) * 6u / 10u;   /* frac * 60, scaled 1e4 */
+    put_u(b, n, cap, deg, degdigits);
+    put_u(b, n, cap, min_e4 / 10000u, 2);
+    if (*n + 1 < cap) b[(*n)++] = '.';
+    put_u(b, n, cap, min_e4 % 10000u, 4);
+    b[*n] = 0;
+}
+
+/* ---- one sentence, with checksum -------------------------------------- */
+
+static void send_nmea(int fd, const char *body, int blen)
+{
+    char line[160];
+    int n = 0, i;
+    unsigned char ck = 0;
+    static const char HEX[] = "0123456789ABCDEF";
+
+    if (blen + 8 > (int)sizeof line) return;
+    line[n++] = '$';
+    for (i = 0; i < blen; i++) {
+        line[n++] = body[i];
+        ck ^= (unsigned char)body[i];
+    }
+    line[n++] = '*';
+    line[n++] = HEX[(ck >> 4) & 0xF];
+    line[n++] = HEX[ck & 0xF];
+    line[n++] = '\r';
+    line[n++] = '\n';
+    if (r_write) r_write(fd, line, (u32)n);
+}
+
+/* ---- UTC from time(), integer only ------------------------------------ */
+
+static void civil_from_days(long z, unsigned *y, unsigned *m, unsigned *d)
+{
+    long era, doe, yoe, doy, mp, day, mon, yr;
+    z += 719468;
+    era = (z >= 0 ? z : z - 146096) / 146097;
+    doe = z - era * 146097;
+    yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    yr = yoe + era * 400;
+    doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    mp = (5 * doy + 2) / 153;
+    day = doy - (153 * mp + 2) / 5 + 1;
+    mon = mp < 10 ? mp + 3 : mp - 9;
+    if (mon <= 2) yr++;
+    *y = (unsigned)yr;
+    *m = (unsigned)mon;
+    *d = (unsigned)day;
+}
+
+/* ---- the burst -------------------------------------------------------- */
+
+static void send_burst(int fd)
+{
+    char b[160];
+    int n;
+    long t = r_time ? r_time(0) : 0;
+    long days = t / 86400;
+    unsigned secs = (unsigned)(t - days * 86400);
+    unsigned hh = secs / 3600, mi = (secs / 60) % 60, ss = secs % 60;
+    unsigned yy, mo, dd;
+
+    civil_from_days(days, &yy, &mo, &dd);
+
+    /* GPRMC -- the one it refuses to work without. "A" = fix valid. */
+    n = 0; b[0] = 0;
+    s_cat(b, sizeof b, &n, "GPRMC,");
+    put_u(b, &n, sizeof b, hh, 2); put_u(b, &n, sizeof b, mi, 2);
+    put_u(b, &n, sizeof b, ss, 2);
+    s_cat(b, sizeof b, &n, ".00,A,");
+    put_coord(b, &n, sizeof b, g_lat, 2);
+    s_cat(b, sizeof b, &n, g_lat < 0 ? ",S," : ",N,");
+    put_coord(b, &n, sizeof b, g_lon, 3);
+    s_cat(b, sizeof b, &n, g_lon < 0 ? ",W," : ",E,");
+    s_cat(b, sizeof b, &n, "0.00,0.00,");
+    put_u(b, &n, sizeof b, dd, 2); put_u(b, &n, sizeof b, mo, 2);
+    put_u(b, &n, sizeof b, yy % 100, 2);
+    s_cat(b, sizeof b, &n, ",,,A");
+    send_nmea(fd, b, n);
+
+    /* GPGGA -- fix quality 1, 10 satellites, HDOP 0.9, 50 m altitude. */
+    n = 0; b[0] = 0;
+    s_cat(b, sizeof b, &n, "GPGGA,");
+    put_u(b, &n, sizeof b, hh, 2); put_u(b, &n, sizeof b, mi, 2);
+    put_u(b, &n, sizeof b, ss, 2);
+    s_cat(b, sizeof b, &n, ".00,");
+    put_coord(b, &n, sizeof b, g_lat, 2);
+    s_cat(b, sizeof b, &n, g_lat < 0 ? ",S," : ",N,");
+    put_coord(b, &n, sizeof b, g_lon, 3);
+    s_cat(b, sizeof b, &n, g_lon < 0 ? ",W," : ",E,");
+    s_cat(b, sizeof b, &n, "1,10,0.9,50.0,M,20.0,M,,");
+    send_nmea(fd, b, n);
+
+    /* GPGSA -- automatic mode, 3D fix. */
+    send_nmea(fd, "GPGSA,A,3,01,02,03,04,05,06,07,08,09,10,,,1.6,0.9,1.3", 53);
+
+    /* GPGSV -- one message, four satellites in view, healthy C/No. */
+    send_nmea(fd, "GPGSV,1,1,10,01,60,045,45,02,55,135,44,03,50,225,43,04,45,315,42", 64);
+
+    /* GPVTG -- stationary. */
+    send_nmea(fd, "GPVTG,0.00,T,,M,0.00,N,0.00,K,A", 31);
+}
+
+static void *gps_thread(void *arg)
+{
+    int fd = -1;
+    (void)arg;
+    for (;;) {
+        if (fd < 0) {
+            /* Create the FIFO if GpsBridge has not. It shells out to
+             * "mknod"/"toolbox mknod", which is not present on every build;
+             * mkfifo(3) needs no shell at all. */
+            if (r_access && r_access(FIFO_PATH, 0) != 0 && r_mkfifo)
+                r_mkfifo(FIFO_PATH, 0660);
+            /* O_RDWR, not O_WRONLY: on a FIFO that never blocks waiting for a
+             * reader, and holding a read end ourselves means a write can
+             * never raise SIGPIPE and kill the app. O_NONBLOCK so a full pipe
+             * costs an EAGAIN rather than a stuck thread. */
+            if (r_open) fd = r_open(FIFO_PATH, 2 | 04000, 0);
+            if (fd < 0) {
+                if (r_usleep) r_usleep(1000000);
+                continue;
+            }
+            LOGI("feeding synthetic NMEA into %s", FIFO_PATH);
+            log_line("gps    feeding synthetic NMEA (no real fix needed)", "", "");
+        }
+        send_burst(fd);
+        if (r_usleep) r_usleep(1000000);        /* 1 Hz, like a real receiver */
+    }
+}
+
+static void gps_start(void)
+{
+    static unsigned long tid;
+    static int started;
+    if (!g_gps || started) return;
+    r_mkfifo = (void *)dlsym(RTLD_DEFAULT, "mkfifo");
+    r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
+    r_time = (void *)dlsym(RTLD_DEFAULT, "time");
+    r_pthread_create = (void *)dlsym(RTLD_DEFAULT, "pthread_create");
+    if (!r_pthread_create || !r_time || !r_usleep) {
+        LOGE("cannot start the synthetic GPS feed (missing libc entry points)");
+        return;
+    }
+    started = 1;
+    if (r_pthread_create(&tid, 0, gps_thread, 0) != 0)
+        LOGE("synthetic GPS thread would not start");
+}
+
+/*
+ * "off" / "no" / "0" turns the feed off. Otherwise "<lat>,<lon>" in decimal
+ * degrees, parsed into microdegrees without touching a float.
+ */
+static int parse_gps(const char *v)
+{
+    int sign = 1, i = 0, k;
+    int val[2] = {0, 0}, got = 0;
+
+    if (s_ncmp(v, "off", 3) == 0 || s_ncmp(v, "no", 2) == 0 ||
+        (v[0] == '0' && (v[1] == 0 || v[1] == '\n'))) {
+        g_gps = 0;
+        return 1;
+    }
+    while (got < 2) {
+        int whole = 0, frac = 0, scale = 1000000;
+        sign = 1;
+        while (v[i] == ' ') i++;
+        if (v[i] == '-') { sign = -1; i++; }
+        else if (v[i] == '+') i++;
+        if (v[i] < '0' || v[i] > '9') return 0;
+        while (v[i] >= '0' && v[i] <= '9') whole = whole * 10 + (v[i++] - '0');
+        if (v[i] == '.') {
+            i++;
+            for (k = 0; k < 6; k++) {
+                scale /= 10;
+                if (v[i] >= '0' && v[i] <= '9') frac += (v[i++] - '0') * scale;
+            }
+            while (v[i] >= '0' && v[i] <= '9') i++;   /* ignore extra digits */
+        }
+        val[got++] = sign * (whole * 1000000 + frac);
+        if (got < 2) {
+            while (v[i] == ' ') i++;
+            if (v[i] != ',') return 0;
+            i++;
+        }
+    }
+    g_lat = val[0];
+    g_lon = val[1];
+    g_gps = 1;
+    return 1;
 }

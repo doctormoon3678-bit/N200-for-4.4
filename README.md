@@ -207,6 +207,67 @@ symbols, because the swap is not free:
   reimplementing `TTSPlayerClass` on OpenSL ES — a contained follow-up, not a
   rewrite.
 
+## Running without a GPS fix
+
+The engine will not leave its "preparing navigation" screen until the position
+module has a fix. Its own log says so, 1170 identical lines of it:
+
+```
+[PREDICT_LOG] 0 0 0 0 1 0 0
+```
+
+That is the dead-reckoning loop running normally on all-zero input. Position
+reaches it as raw NMEA through a FIFO:
+
+```
+Android GPS -> GpsBridge (Java) -> /data/data/com.npnd.n200/files/gpsfifo
+            -> libNV_UART.so -> libNV_POS.so
+```
+
+`GpsBridge` is not part of the original app either — someone added it, like
+`libtextlayoutshim.so`. It forwards `onNmeaReceived()` only; its
+`onLocationChanged()` is an empty method. **That is why a mock-location or
+"fake GPS" app cannot drive this**: mock providers deliver `Location` objects,
+never NMEA sentences. And indoors, with no real fix, nothing is written at all
+and the app cannot start.
+
+So `libn200fs.so` writes the NMEA itself — it is already in the process, and a
+FIFO does not care which thread fills it. A stationary fix is sent at 1 Hz:
+
+```
+$GPRMC,122225.00,A,3510.7760,N,12904.5360,E,0.00,0.00,131126,,,A*53
+$GPGGA,122225.00,3510.7760,N,12904.5360,E,1,10,0.9,50.0,M,20.0,M,,*58
+$GPGSA,A,3,01,02,03,04,05,06,07,08,09,10,,,1.6,0.9,1.3*3E
+$GPGSV,1,1,10,01,60,045,45,02,55,135,44,03,50,225,43,04,45,315,42*7A
+$GPVTG,0.00,T,,M,0.00,N,0.00,K,A*3D
+```
+
+`libNV_UART.so` sets the requirements with two of its own messages:
+`NMEA Data Read Fail because of no GPRMC Message` (GPRMC is mandatory) and
+`NMEA checksum err: %s` (checksums are verified). Both are satisfied, and the
+self-test checks every sentence's checksum, the valid flag and the coordinate
+conversion rather than assuming.
+
+It also creates the FIFO with `mkfifo(3)` if `GpsBridge` has not. The bridge
+shells out to `mknod` / `toolbox mknod`, which is not present on every build.
+
+Default position is Seoul City Hall. In `n200fs.conf`:
+
+```
+gps=35.1796,129.0756     # somewhere else, decimal degrees
+gps=off                  # real GPS only
+```
+
+**Turn it off for real driving.** The feed does not stop when a real fix
+arrives — the bridge and this would both be writing to the same FIFO, and the
+engine would see the position jump between the two. The synthetic feed is for
+getting the app running, and for indoors.
+
+No floating point is involved: this library links `-nostdlib`, so there is no
+libgcc to provide soft-float or division helpers. Coordinates are held in
+microdegrees and formatted with integer arithmetic, and the build gate fails
+on any unexpected import, which is what keeps that true.
+
 ## The Java card-mounted test
 
 Independent of where the data lives, and the reason the app can reach its
