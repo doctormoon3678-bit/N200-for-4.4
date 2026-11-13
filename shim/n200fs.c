@@ -1697,7 +1697,20 @@ int _Z28NaviGetUnloadNaviProcessFlagv(void)
     static struct gate g = { "_Z28NaviGetUnloadNaviProcessFlagv",
                              "NaviGetUnloadNaviProcessFlag", 0, 0, 0, 0 };
     int v = gate_real(&g, _Z28NaviGetUnloadNaviProcessFlagv);
-    return v < 0 ? 0 : v;
+    long t;
+    /* This one is stuck the other way round: 1 means "navigation processes
+     * not loaded", and it is cleared by the SD-insert handler that a device
+     * log showed never running. The processes themselves are up -- the map
+     * tables are being read -- so after the same wait, answer 0. */
+    if (v != 1 || !g_force) return v < 0 ? 0 : v;
+    t = now_s();
+    if (!g.since) g.since = t;
+    if (t - g.since < 30) return 1;
+    if (g.since != -1) {
+        g.since = -1;
+        log_line("gate   ", g.label, " stuck at 1 -- answering 0 from here on");
+    }
+    return 0;
 }
 
 /* ====================================================================== *
@@ -1788,7 +1801,9 @@ static int trace_interesting(const char *t)
 {
     static const char *const KEY[] = {
         "Ready", "SDCard", "SdCard", "DBLoad", "DBLoadInit", "FirstLayer",
-        "mdGet", "GPS", "Gps", "Navi ON", "OnTimerEvent", "Unload", "Load",
+        "mdGet", "Navi ON", "Unload", "LoadNavi", "Mount", "MessgeEvent",
+        "Media", "LI_EVENTS", "OPEN_DB", "CLOSE_DB", "INSERT", "EJECT",
+        "STARTUP", "PreActivated", "MapInitial", "Surface", "surface", "EGL",
         "fail", "Fail", "FAIL", "error", "Error", "ERROR", 0
     };
     int i, j;
@@ -1803,53 +1818,115 @@ static int trace_interesting(const char *t)
     return 0;
 }
 
-static void trace_capture(const char *tag, void *a0, void *a1, void *a2,
-                          void *a3, void *a4, void *a5)
+/* Expand a printf format with the word-sized arguments that followed it.
+ * Only what the engine's messages use: %d %i %u %x %X %c %s %p, with flags,
+ * width and an 'l'. A %s argument is validated before it is read; anything
+ * unrecognised (%f, %lld) ends expansion, since the argument words can no
+ * longer be lined up. */
+static void fmt_expand(char *out, int cap, int *n, const char *f,
+                       const unsigned long *v, int nv)
+{
+    int k = 0;
+    while (*f && *n + 1 < cap) {
+        char c, t[200];
+        if (*f != '%') { out[(*n)++] = *f++; out[*n] = 0; continue; }
+        f++;
+        if (*f == '%') { out[(*n)++] = *f++; out[*n] = 0; continue; }
+        while (*f == '-' || *f == '+' || *f == ' ' || *f == '#' || *f == '.' ||
+               (*f >= '0' && *f <= '9')) f++;
+        if (*f == 'l' && f[1] != 'l') f++;
+        c = *f;
+        if (!c) break;
+        f++;
+        if (k >= nv) { s_cat(out, cap, n, "?"); continue; }
+        if (c == 'd' || c == 'i' || c == 'u') {
+            long sv = (long)(int)v[k++];
+            if (c != 'u' && sv < 0) { s_cat(out, cap, n, "-"); sv = -sv; }
+            put_u(out, n, cap, (unsigned)sv, 0);
+        } else if (c == 'x' || c == 'X' || c == 'p') {
+            static const char H[] = "0123456789abcdef";
+            unsigned x = (unsigned)v[k++];
+            int sh, on = 0;
+            for (sh = 28; sh >= 0; sh -= 4) {
+                int dgt = (int)((x >> sh) & 15);
+                if (dgt || on || sh == 0) {
+                    on = 1;
+                    if (*n + 1 < cap) { out[(*n)++] = H[dgt]; out[*n] = 0; }
+                }
+            }
+        } else if (c == 'c') {
+            char ch = (char)v[k++];
+            if (ch >= 0x20 && *n + 1 < cap) { out[(*n)++] = ch; out[*n] = 0; }
+        } else if (c == 's') {
+            if (grab_text((const char *)v[k], t, (int)sizeof t))
+                s_cat(out, cap, n, t);
+            else
+                s_cat(out, cap, n, "<?>");
+            k++;
+        } else {
+            s_cat(out, cap, n, "<..>");
+            break;
+        }
+    }
+}
+
+/* Each distinct message is logged a few times, not every time: the engine
+ * repeats some of them hundreds of times a second and they crowded the
+ * messages that matter out of the last log. */
+static int seen_too_often(const void *fmt)
+{
+    static const void *key[256];
+    static unsigned char cnt[256];
+    unsigned h = (unsigned)(((unsigned long)fmt >> 2) & 255);
+    if (key[h] != fmt) { key[h] = fmt; cnt[h] = 0; }
+    if (cnt[h] >= 4) return 1;
+    cnt[h]++;
+    return 0;
+}
+
+static void trace_capture(const char *tag, void *a1, void *a2, void *a3,
+                          const unsigned long *v, int nv)
 {
     static int count;
-    void *args[6];
-    char line[320];
+    char line[480];
     char piece[200];
-    int n = 0, i, any = 0;
+    int n = 0;
 
-    if (!g_trace || count >= 400) return;
-    args[0] = a0; args[1] = a1; args[2] = a2;
-    args[3] = a3; args[4] = a4; args[5] = a5;
-
+    if (!g_trace || count >= 1500) return;
     line[0] = 0;
-    for (i = 0; i < 6; i++) {
-        if (!grab_text((const char *)args[i], piece, (int)sizeof piece))
-            continue;
-        if (!trace_interesting(piece) && i >= 3) {
-            /* keep scanning: the format string may be in a later slot */
-        }
-        if (any) s_cat(line, sizeof line, &n, " | ");
+    if (grab_text((const char *)a1, piece, (int)sizeof piece)) {
         s_cat(line, sizeof line, &n, piece);
-        any = 1;
+        s_cat(line, sizeof line, &n, " | ");
     }
-    if (!any || !trace_interesting(line)) return;
+    if (grab_text((const char *)a2, piece, (int)sizeof piece)) {
+        s_cat(line, sizeof line, &n, piece);
+        s_cat(line, sizeof line, &n, " | ");
+    }
+    if (readable(a3) && grab_text((const char *)a3, piece, 8)) {
+        if (seen_too_often(a3)) return;
+        fmt_expand(line, (int)sizeof line, &n, (const char *)a3, v, nv);
+    } else if (!n) {
+        return;
+    }
+    if (!trace_interesting(line)) return;
     count++;
     log_line(tag, line, "");
-    if (count == 400) log_line("trace  (further engine trace suppressed)", "", "");
+    if (count == 1500) log_line("trace  (further engine trace suppressed)", "", "");
 }
 
-int _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *a0, void *a1, void *a2,
-                                             void *a3, void *a4, void *a5)
-{
-    trace_capture("trace  ", a0, a1, a2, a3, a4, a5);
-    return 0;
+#define TRACE_HOOK(sym, tag) \
+int sym(void *a0, void *a1, void *a2, void *a3, ...) \
+{ \
+    unsigned long v[8]; \
+    int i; \
+    __builtin_va_list ap; \
+    (void)a0; \
+    __builtin_va_start(ap, a3); \
+    for (i = 0; i < 8; i++) v[i] = __builtin_va_arg(ap, unsigned long); \
+    __builtin_va_end(ap); \
+    trace_capture(tag, a1, a2, a3, v, 8); \
+    return 0; \
 }
-
-int _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z(void *a0, void *a1, void *a2,
-                                             void *a3, void *a4, void *a5)
-{
-    trace_capture("traceE ", a0, a1, a2, a3, a4, a5);
-    return 0;
-}
-
-int _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z(void *a0, void *a1, void *a2,
-                                             void *a3, void *a4, void *a5)
-{
-    trace_capture("traceW ", a0, a1, a2, a3, a4, a5);
-    return 0;
-}
+TRACE_HOOK(_ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z, "trace  ")
+TRACE_HOOK(_ZN14NVDebugMessage8traceErrEiPKcS1_S1_z, "traceE ")
+TRACE_HOOK(_ZN14NVDebugMessage8traceWarEiPKcS1_S1_z, "traceW ")

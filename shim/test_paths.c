@@ -25,8 +25,7 @@ int   n200_access(const char *, int);
 void *n200_opendir(const char *);
 int   closedir(void *);
 int   _Z22NaviGetNaviSDCardStatev(void);
-int   _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *, void *, void *, void *,
-                                               void *, void *);
+int   _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *, void *, void *, void *, ...);
 int   n200_mkdir(const char *, unsigned);
 int   n200_unlink(const char *);
 int   n200_rename(const char *, const char *);
@@ -295,7 +294,7 @@ int main(int argc, char **argv)
     {
         char log[8192];
         int n = slurp(buf, log, sizeof log);
-        ck(n > 0 && strstr(log, "CNaviReadyScene::OnTimerEvent") != NULL,
+        ck(n > 0 && strstr(log, "NaviGetNaviSDCardState(0) bDBLoadInit(1)") != NULL,
            "  and the gate's own trace line is captured");
         ck(n > 0 && strstr(log, "unremarkable") == NULL,
            "  while uninteresting messages are filtered out");
