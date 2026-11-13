@@ -62,6 +62,10 @@ cat > "$WORK/export.map" <<'EOF'
     mkdir; rmdir; unlink; remove; rename;
     utimes; statfs; system;
     n200fs_note;
+    _Z22NaviGetNaviSDCardStatev;
+    _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z;
+    _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z;
+    _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z;
   local: *;
 };
 EOF
@@ -104,7 +108,11 @@ fi
 # 3. exports are exactly the interposed set -- an extra export would be bound
 #    by the app's libraries in place of libc's, which is how you break a
 #    program you meant to fix.
-want="access
+want="_Z22NaviGetNaviSDCardStatev
+_ZN14NVDebugMessage8traceErrEiPKcS1_S1_z
+_ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
+_ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
+access
 fopen
 mkdir
 n200fs_note
@@ -122,7 +130,7 @@ got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports the 13 interposed entry points, plus n200fs_note"
+    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the SD-card gate and n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true

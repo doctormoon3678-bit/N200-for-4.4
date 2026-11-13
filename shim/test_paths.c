@@ -24,6 +24,9 @@ int   n200_stat(const char *, void *);
 int   n200_access(const char *, int);
 void *n200_opendir(const char *);
 int   closedir(void *);
+int   _Z22NaviGetNaviSDCardStatev(void);
+int   _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *, void *, void *, void *,
+                                               void *, void *);
 int   n200_mkdir(const char *, unsigned);
 int   n200_unlink(const char *);
 int   n200_rename(const char *, const char *);
@@ -269,6 +272,34 @@ int main(int argc, char **argv)
     if (f) fclose(f);
     ck(n200_fopen("/mnt/extSdCardOther/x", "r") == NULL,
        "a path that merely starts with the prefix is not matched");
+
+    /* The "preparing navigation" gate, and the engine trace capture. */
+    ck(_Z22NaviGetNaviSDCardStatev() == 1,
+       "NaviGetNaviSDCardState() reports the card as present");
+
+    /* A realistic call, and then a hostile one: integer arguments in pointer
+     * slots must not fault the process. */
+    _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(
+        (void *)0, (void *)"NaviReadyScene.cpp", (void *)"OnTimerEvent",
+        (void *)"[CNaviReadyScene::OnTimerEvent] NaviGetNaviSDCardState(%d)"
+                " bDBLoadInit(%d) - TIMER_ID_CNAVIMODE_READY",
+        (void *)0, (void *)1);
+    _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(
+        (void *)1, (void *)2, (void *)3, (void *)0xdeadbeef,
+        (void *)0xffffffff, (void *)0x7);
+    _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(
+        (void *)0, (void *)"x.cpp", (void *)"f",
+        (void *)"something entirely unremarkable happened", 0, 0);
+    ck(1, "  engine trace hooks survive integer arguments in pointer slots");
+    snprintf(buf, sizeof buf, "%s/n200fs.log", WRITE);
+    {
+        char log[8192];
+        int n = slurp(buf, log, sizeof log);
+        ck(n > 0 && strstr(log, "CNaviReadyScene::OnTimerEvent") != NULL,
+           "  and the gate's own trace line is captured");
+        ck(n > 0 && strstr(log, "unremarkable") == NULL,
+           "  while uninteresting messages are filtered out");
+    }
 
     check_gps(ck, ck_skip_named);
 

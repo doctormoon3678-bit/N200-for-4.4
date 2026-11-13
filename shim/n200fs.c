@@ -82,6 +82,9 @@ int   __android_log_print(int, const char *, const char *, ...);
 /* Defined at the end of the file, used before it. */
 static void gps_start(void);
 static int  parse_gps(const char *v);
+extern int  g_sdstate;
+extern int  g_trace;
+extern int  g_trace_all;
 static int  is_gps_fifo(const char *p);
 static int  gps_open_pipe(const char *path);
 static void *(*r_fdopen)(int, const char *);
@@ -354,6 +357,12 @@ static void read_conf(const char *path)
                     g_enginelog = line[10] != '0';
                 else if (s_ncmp(line, "gps=", 4) == 0)
                     parse_gps(line + 4);
+                else if (s_ncmp(line, "sdstate=", 8) == 0)
+                    g_sdstate = line[8] != '0' && s_ncmp(line + 8, "off", 3) != 0;
+                else if (s_ncmp(line, "trace=", 6) == 0) {
+                    g_trace_all = s_ncmp(line + 6, "all", 3) == 0;
+                    g_trace = line[6] != '0' && s_ncmp(line + 6, "off", 3) != 0;
+                }
             }
         }
         start = i + 1;
@@ -1553,4 +1562,212 @@ static int parse_gps(const char *v)
     g_lon = val[1];
     g_gps = 1;
     return 1;
+}
+
+/* ====================================================================== *
+ *  The "preparing navigation" gate
+ *
+ *  CNaviReadyScene, in libNV_GUI.so, polls on a timer and logs exactly what
+ *  it is waiting for:
+ *
+ *    [CNaviReadyScene::OnTimerEvent] NaviGetNaviSDCardState(%d) bDBLoadInit(%d)
+ *    CNaviReadyScene::OnTimerEvent() : mdGetFirstLayerOnState() = %d, ...
+ *
+ *  So the screen is gated on the SD card state, not on GPS -- which is why
+ *  neither a real fix nor a synthetic one moved it.
+ *
+ *  NaviGetNaviSDCardState() is defined in libGUI_WIDGET.so and IMPORTED by
+ *  libNV_GUI.so, so this library -- bound ahead of libGUI_WIDGET in
+ *  libNV_GUI's DT_NEEDED -- can answer it instead. The original is a plain
+ *  getter on a global bool (ARM, 52 bytes: load the global, LDRB, return), so
+ *  returning 1 here is exactly equivalent to that global being set, without
+ *  patching a single byte of vendor code.
+ *
+ *  The global is set from CNaviScene::OnSDCardInsert(), which runs when Java's
+ *  SetMessgeEvent(0, 1, PATH_SDCARD) arrives. That path is now reached -- the
+ *  dex patch sees to it -- but whether the native handler accepts the event is
+ *  not something that can be established from outside, and this makes it moot.
+ *
+ *  sdstate=off in n200fs.conf gives the original behaviour back.
+ * ====================================================================== */
+
+int g_sdstate = 1;
+
+int _Z22NaviGetNaviSDCardStatev(void)
+{
+    static int said;
+    if (!g_sdstate) {
+        /* Fall through to the real one. It is in libGUI_WIDGET.so, which this
+         * library does not depend on, so it has to be found by name. */
+        static int (*real)(void);
+        static int tried;
+        if (!tried) {
+            tried = 1;
+            real = (int (*)(void))dlsym(RTLD_DEFAULT,
+                                        "_Z22NaviGetNaviSDCardStatev");
+        }
+        if (real && real != _Z22NaviGetNaviSDCardStatev) return real();
+        return 0;
+    }
+    if (!said) {
+        said = 1;
+        LOGI("reporting the SD card as present to CNaviReadyScene");
+        log_line("sdcard reporting the card as present to CNaviReadyScene",
+                 "", "");
+    }
+    return 1;
+}
+
+/* ====================================================================== *
+ *  Capturing the engine's own trace
+ *
+ *  Its debug messages go through NVDebugMessage::traceMsg/traceErr into
+ *  libNVDebugMessage.so, which forwards them over shared memory to an ILogger
+ *  server process -- a head-unit daemon that does not exist here. So the most
+ *  informative output the engine produces goes nowhere.
+ *
+ *  Those two are imported by libNV_GUI.so and five of its neighbours, so they
+ *  can be answered here and written to n200fs.log instead.
+ *
+ *  The signature is traceMsg(int, const char*, const char*, const char*, ...)
+ *  by its mangled name, but whether there is also a hidden `this` cannot be
+ *  told from the name, so no argument position is assumed: all six candidate
+ *  slots are examined and any that points at readable text is logged. Every
+ *  dereference is checked first by handing the pointer to write() on
+ *  /dev/null, which makes the kernel return EFAULT rather than letting a stray
+ *  integer argument fault the process. Results are cached per pointer, because
+ *  these are static literals and the engine traces thousands of times a
+ *  second.
+ *
+ *  Filtered to the messages that bear on why startup stalls, so the log stays
+ *  readable; trace=all in n200fs.conf keeps everything.
+ * ====================================================================== */
+
+int g_trace = 1;
+int g_trace_all;
+
+/*
+ * Is this address inside a loaded shared object?
+ *
+ * dladdr() answers that by walking the linker's list of loaded objects and
+ * comparing addresses -- it never dereferences the pointer, so a stray integer
+ * argument in a pointer slot costs nothing. The engine's trace format strings
+ * are literals in its libraries' .rodata, so they validate; 1, 7 and
+ * 0xdeadbeef do not.
+ *
+ * The first attempt here handed the pointer to write() on /dev/null and let
+ * the kernel return EFAULT. That does work on a device, but it is a syscall
+ * per pointer and it cannot be tested -- ASan intercepts write(), checks the
+ * buffer itself and reports the fault instead of passing it to the kernel, so
+ * the self-test crashed on exactly the case the guard existed for. A guard
+ * that cannot be exercised is not a guard.
+ */
+static int (*r_dladdr)(const void *, void *);
+
+static int readable(const void *p)
+{
+    static const void *key[64];
+    static char val[64];
+    void *info[4];
+    unsigned h;
+
+    if (!p) return 0;
+    if (!r_dladdr) {
+        r_dladdr = (int (*)(const void *, void *))dlsym(RTLD_DEFAULT, "dladdr");
+        if (!r_dladdr) return 0;
+    }
+    h = (unsigned)(((unsigned long)p >> 3) & 63);
+    if (key[h] == p) return val[h];
+    key[h] = p;
+    val[h] = (char)(r_dladdr(p, info) != 0);
+    return val[h];
+}
+
+/* Copy p into out if it looks like a printable string. Returns its length. */
+static int grab_text(const char *p, char *out, int cap)
+{
+    int i;
+    if (!readable(p)) return 0;
+    for (i = 0; i < cap - 1; i++) {
+        unsigned char c;
+        /* Re-validate as we go: a string near the end of a mapping must not
+         * be run off the end of it. */
+        if ((i & 63) == 0 && !readable(p + i)) break;
+        c = (unsigned char)p[i];
+        if (c == 0) break;
+        if (c < 0x20 && c != '\n' && c != '\t') return 0;   /* not text */
+        out[i] = (char)c;
+    }
+    out[i] = 0;
+    return i >= 4 ? i : 0;
+}
+
+static int trace_interesting(const char *t)
+{
+    static const char *const KEY[] = {
+        "Ready", "SDCard", "SdCard", "DBLoad", "DBLoadInit", "FirstLayer",
+        "mdGet", "GPS", "Gps", "Navi ON", "OnTimerEvent", "Unload", "Load",
+        "fail", "Fail", "FAIL", "error", "Error", "ERROR", 0
+    };
+    int i, j;
+    if (g_trace_all) return 1;
+    for (i = 0; KEY[i]; i++) {
+        for (j = 0; t[j]; j++) {
+            int k = 0;
+            while (KEY[i][k] && t[j + k] == KEY[i][k]) k++;
+            if (!KEY[i][k]) return 1;
+        }
+    }
+    return 0;
+}
+
+static void trace_capture(const char *tag, void *a0, void *a1, void *a2,
+                          void *a3, void *a4, void *a5)
+{
+    static int count;
+    void *args[6];
+    char line[320];
+    char piece[200];
+    int n = 0, i, any = 0;
+
+    if (!g_trace || count >= 400) return;
+    args[0] = a0; args[1] = a1; args[2] = a2;
+    args[3] = a3; args[4] = a4; args[5] = a5;
+
+    line[0] = 0;
+    for (i = 0; i < 6; i++) {
+        if (!grab_text((const char *)args[i], piece, (int)sizeof piece))
+            continue;
+        if (!trace_interesting(piece) && i >= 3) {
+            /* keep scanning: the format string may be in a later slot */
+        }
+        if (any) s_cat(line, sizeof line, &n, " | ");
+        s_cat(line, sizeof line, &n, piece);
+        any = 1;
+    }
+    if (!any || !trace_interesting(line)) return;
+    count++;
+    log_line(tag, line, "");
+    if (count == 400) log_line("trace  (further engine trace suppressed)", "", "");
+}
+
+int _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z(void *a0, void *a1, void *a2,
+                                             void *a3, void *a4, void *a5)
+{
+    trace_capture("trace  ", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+
+int _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z(void *a0, void *a1, void *a2,
+                                             void *a3, void *a4, void *a5)
+{
+    trace_capture("traceE ", a0, a1, a2, a3, a4, a5);
+    return 0;
+}
+
+int _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z(void *a0, void *a1, void *a2,
+                                             void *a3, void *a4, void *a5)
+{
+    trace_capture("traceW ", a0, a1, a2, a3, a4, a5);
+    return 0;
 }

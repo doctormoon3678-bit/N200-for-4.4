@@ -207,6 +207,61 @@ symbols, because the swap is not free:
   reimplementing `TTSPlayerClass` on OpenSL ES — a contained follow-up, not a
   rewrite.
 
+## The "preparing navigation" gate
+
+`CNaviReadyScene`, in `libNV_GUI.so`, polls on a timer and its own log lines
+say exactly what it waits for:
+
+```
+[CNaviReadyScene::OnTimerEvent] NaviGetNaviSDCardState(%d) bDBLoadInit(%d) - TIMER_ID_CNAVIMODE_READY
+CNaviReadyScene::OnTimerEvent() : mdGetFirstLayerOnState() = %d, NaviGetUnloadNaviProcessFlag() = %d, bDBLoadInit(%d)
+```
+
+**The gate is the SD-card state, not GPS.** GPS appears only as a separate
+event (`EVENT_NAVI_GPS_FIRST_RECEIVE`), which is why neither a real fix nor a
+synthetic one moved the screen.
+
+`NaviGetNaviSDCardState()` is defined in `libGUI_WIDGET.so` and **imported** by
+`libNV_GUI.so`, so the same interposition that redirects libc reaches it:
+`libn200fs.so` is `libNV_GUI.so`'s first `DT_NEEDED`, well ahead of
+`libGUI_WIDGET.so`, so it answers the call. The original is a plain getter on a
+global bool — 52 bytes of ARM that loads the global, `LDRB`, returns — so
+answering 1 is exactly equivalent to that global being set, with no vendor
+byte patched.
+
+That global is set from `CNaviScene::OnSDCardInsert()`, which runs when Java's
+`SetMessgeEvent(0, 1, PATH_SDCARD)` arrives. The dex patch above makes that
+call happen; whether the native handler then accepts the event is not
+observable from outside, and this makes the question moot.
+
+`sdstate=off` in `n200fs.conf` restores the original behaviour.
+
+### Capturing the engine's own trace
+
+The engine's debug output goes through `NVDebugMessage::traceMsg`/`traceErr`
+into `libNVDebugMessage.so`, which forwards it over shared memory to an
+**ILogger server process** — a head-unit daemon that does not exist here. So
+the most informative thing the engine produces goes nowhere at all.
+
+Those two are imported by `libNV_GUI.so` and five of its neighbours, so they
+are answered here instead and written to `n200fs.log`, prefixed `trace`. The
+mangled name gives `(int, const char*, const char*, const char*, ...)` but
+cannot say whether there is also a hidden `this`, so no argument position is
+assumed: all six candidate slots are examined and any that points at readable
+text is logged.
+
+Every candidate is validated with `dladdr()` first, which decides whether an
+address lies inside a loaded shared object **without dereferencing it** — so an
+integer argument in a pointer slot costs nothing. The first attempt instead
+handed the pointer to `write()` on `/dev/null` and let the kernel return
+`EFAULT`; that works on a device but costs a syscall per pointer and cannot be
+tested, because ASan intercepts `write()`, checks the buffer itself and reports
+the fault rather than passing it to the kernel. The self-test crashed on
+precisely the case the guard existed for. A guard that cannot be exercised is
+not a guard.
+
+Filtered to the messages bearing on startup; `trace=all` keeps everything.
+
 ## Running without a GPS fix
 
 The engine will not leave its "preparing navigation" screen until the position
