@@ -83,6 +83,7 @@ int   __android_log_print(int, const char *, const char *, ...);
 static void gps_start(void);
 static int  parse_gps(const char *v);
 extern int  g_sdstate;
+extern int  g_force;
 extern int  g_trace;
 extern int  g_trace_all;
 static int  is_gps_fifo(const char *p);
@@ -359,6 +360,8 @@ static void read_conf(const char *path)
                     parse_gps(line + 4);
                 else if (s_ncmp(line, "sdstate=", 8) == 0)
                     g_sdstate = line[8] != '0' && s_ncmp(line + 8, "off", 3) != 0;
+                else if (s_ncmp(line, "force=", 6) == 0)
+                    g_force = line[6] != '0' && s_ncmp(line + 6, "off", 3) != 0;
                 else if (s_ncmp(line, "trace=", 6) == 0) {
                     g_trace_all = s_ncmp(line + 6, "all", 3) == 0;
                     g_trace = line[6] != '0' && s_ncmp(line + 6, "off", 3) != 0;
@@ -1592,30 +1595,109 @@ static int parse_gps(const char *v)
  * ====================================================================== */
 
 int g_sdstate = 1;
+int g_force = 1;
+
+/*
+ * All five values CNaviReadyScene and its neighbours poll are getters defined
+ * in libGUI_WIDGET.so and imported by libNV_GUI.so, so each one passes through
+ * here on its way. That is used twice over: the real value is fetched from
+ * libGUI_WIDGET.so and logged whenever it changes, so the log states which
+ * condition is holding the screen; and the two that have been seen to stick
+ * can be answered here instead.
+ */
+struct gate {
+    const char *sym, *label;
+    int (*real)(void);
+    int tried, last;
+    long since;                     /* when it was first seen at 0 */
+};
+
+static long now_s(void)
+{
+    static long (*t)(void *);
+    if (!t) t = (long (*)(void *))dlsym(RTLD_DEFAULT, "time");
+    return t ? t(0) : 0;
+}
+
+static int gate_real(struct gate *g, int (*self)(void))
+{
+    int v;
+    if (!g->tried) {
+        void *h;
+        g->tried = 1;
+        g->last = -2;
+        /* By handle, not RTLD_DEFAULT: a global lookup would find this
+         * library's own definition first. */
+        h = dlopen("libGUI_WIDGET.so", RTLD_NOW);
+        if (h) g->real = (int (*)(void))dlsym(h, g->sym);
+        if (g->real == self) g->real = 0;
+    }
+    v = g->real ? (g->real() & 0xff) : -1;
+    if (v != g->last) {
+        char num[4];
+        g->last = v;
+        num[0] = v < 0 ? '?' : (char)('0' + (v > 9 ? 9 : v));
+        num[1] = 0;
+        LOGI("gate %s = %s", g->label, num);
+        log_line("gate   ", g->label, v < 0 ? " = (real function not found)"
+                                   : v == 0 ? " = 0" : " = 1");
+    }
+    return v;
+}
+
+/* Answer 1 once the real value has sat at 0 for `wait` seconds. */
+static int gate_forced(struct gate *g, int v, int wait)
+{
+    long t;
+    if (v == 1 || !g_force) return v < 0 ? 0 : v;
+    t = now_s();
+    if (!g->since) g->since = t;
+    if (t - g->since < wait) return v < 0 ? 0 : v;
+    if (g->since != -1) {
+        g->since = -1;
+        log_line("gate   ", g->label, " stuck at 0 -- answering 1 from here on");
+    }
+    return 1;
+}
 
 int _Z22NaviGetNaviSDCardStatev(void)
 {
-    static int said;
-    if (!g_sdstate) {
-        /* Fall through to the real one. It is in libGUI_WIDGET.so, which this
-         * library does not depend on, so it has to be found by name. */
-        static int (*real)(void);
-        static int tried;
-        if (!tried) {
-            tried = 1;
-            real = (int (*)(void))dlsym(RTLD_DEFAULT,
-                                        "_Z22NaviGetNaviSDCardStatev");
-        }
-        if (real && real != _Z22NaviGetNaviSDCardStatev) return real();
-        return 0;
-    }
-    if (!said) {
-        said = 1;
-        LOGI("reporting the SD card as present to CNaviReadyScene");
-        log_line("sdcard reporting the card as present to CNaviReadyScene",
-                 "", "");
-    }
-    return 1;
+    static struct gate g = { "_Z22NaviGetNaviSDCardStatev",
+                             "NaviGetNaviSDCardState", 0, 0, 0, 0 };
+    int v = gate_real(&g, _Z22NaviGetNaviSDCardStatev);
+    if (g_sdstate) return 1;
+    return v < 0 ? 0 : v;
+}
+
+int _Z22mdGetFirstLayerOnStatev(void)
+{
+    static struct gate g = { "_Z22mdGetFirstLayerOnStatev",
+                             "mdGetFirstLayerOnState", 0, 0, 0, 0 };
+    return gate_forced(&g, gate_real(&g, _Z22mdGetFirstLayerOnStatev), 30);
+}
+
+int _Z21NaviGetMapInitialDonev(void)
+{
+    static struct gate g = { "_Z21NaviGetMapInitialDonev",
+                             "NaviGetMapInitialDone", 0, 0, 0, 0 };
+    return gate_forced(&g, gate_real(&g, _Z21NaviGetMapInitialDonev), 30);
+}
+
+/* Watched only: these are passed straight through. */
+int _Z17NaviChkFirstMountv(void)
+{
+    static struct gate g = { "_Z17NaviChkFirstMountv",
+                             "NaviChkFirstMount", 0, 0, 0, 0 };
+    int v = gate_real(&g, _Z17NaviChkFirstMountv);
+    return v < 0 ? 0 : v;
+}
+
+int _Z28NaviGetUnloadNaviProcessFlagv(void)
+{
+    static struct gate g = { "_Z28NaviGetUnloadNaviProcessFlagv",
+                             "NaviGetUnloadNaviProcessFlag", 0, 0, 0, 0 };
+    int v = gate_real(&g, _Z28NaviGetUnloadNaviProcessFlagv);
+    return v < 0 ? 0 : v;
 }
 
 /* ====================================================================== *

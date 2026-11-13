@@ -63,6 +63,10 @@ cat > "$WORK/export.map" <<'EOF'
     utimes; statfs; system;
     n200fs_note;
     _Z22NaviGetNaviSDCardStatev;
+    _Z22mdGetFirstLayerOnStatev;
+    _Z21NaviGetMapInitialDonev;
+    _Z17NaviChkFirstMountv;
+    _Z28NaviGetUnloadNaviProcessFlagv;
     _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z;
@@ -108,7 +112,11 @@ fi
 # 3. exports are exactly the interposed set -- an extra export would be bound
 #    by the app's libraries in place of libc's, which is how you break a
 #    program you meant to fix.
-want="_Z22NaviGetNaviSDCardStatev
+want="_Z17NaviChkFirstMountv
+_Z21NaviGetMapInitialDonev
+_Z22NaviGetNaviSDCardStatev
+_Z22mdGetFirstLayerOnStatev
+_Z28NaviGetUnloadNaviProcessFlagv
 _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
