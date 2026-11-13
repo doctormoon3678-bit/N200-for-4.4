@@ -1,0 +1,69 @@
+# Redirect only the paths the app WRITES to, into its own private data
+# directory, and leave everything it READS on the external SD card.
+#
+# WHY
+# ---
+# The app hard-codes /mnt/extSdCard as its single data root for both reads and
+# writes. On a Samsung KitKat device the card is there and readable, but since
+# Android 4.4 a third-party app may not write anywhere on secondary storage
+# outside Android/data/<package>/. So the reads succeed, the first write gets
+# NULL back from fopen(), and because the return value is never checked the
+# process dies in fprintf -- which is exactly the observed tombstone:
+#
+#   signal 11 (SIGSEGV) fault addr 0000000c
+#   #02 fprintf+12
+#   #03 libNV_CNS2K.so (startMain(_JNIEnv*, _jobject*)+1496)
+#
+# /data/data/com.npnd.n200/ is owned by the app's own uid, so writes there
+# always work with no root and no permission changes.
+#
+# Keeping the reads on the card is the point: the map database
+# (Navkingdom/Common/DB_MAP/NF60_NPND_Korea.sti and friends) is gigabytes and
+# stays exactly where it already is.
+#
+# RULES OF THIS FILE
+# ------------------
+# Every replacement must be NO LONGER than the string it replaces -- the patcher
+# rewrites bytes in place and refuses anything that would move a file offset.
+# That budget is why some targets have abbreviated names.
+#
+# The first rule is prefix-based and does the heavy lifting: rewriting
+# ".../Navkingdom/Persistence" fixes all ~120 files beneath it in one
+# substitution. The app reads these back as well as writing them, so it stays
+# self-consistent; it simply starts from empty state unless you copy the old
+# Persistence directory across (see the README).
+#
+# Deliberately NOT redirected, because they are read-only payload:
+#   Navkingdom/Common/**, Navkingdom/Navi/**, NavKingdom.cfg, NPNDNotice.xml,
+#   CameraVersion.xml, NaviVersionInfo.txt, manual/**, AutoTest.xml,
+#   BackupLogOn.cfg, NVSLOG.CONF, PackUpd/**, Temp*/**
+# Also left alone: the bare "/mnt/extSdCard//" root string, which is used with
+# sprintf to build paths at runtime and cannot be split into read and write.
+
+# -- the bulk of the writes: ~120 state files -------------------------------
+# The native libraries spell the root with three slashes (a root string
+# concatenated with "/" and a "/..." suffix); classes.dex spells the same paths
+# with one. Both forms need the rule, or the Java and native halves would end up
+# writing to different places.
+/mnt/extSdCard///Navkingdom/Persistence=/data/data/com.npnd.n200/Persistence
+/mnt/extSdCard/Navkingdom/Persistence=/data/data/com.npnd.n200/Persistence
+/mnt/extSdCard///Persistence=/data/data/com.npnd.n200/P
+
+# -- the file that actually crashes (fprintf on a NULL FILE*) ---------------
+/mnt/extSdCard///Navkingdom/LoggerServerPID=/data/data/com.npnd.n200/LoggerServerPID
+
+# -- other unmistakably runtime-generated files -----------------------------
+/mnt/extSdCard///Navkingdom/log_rawdata_start_flag_true=/data/data/com.npnd.n200/log_rawdata_start_flag_true
+/mnt/extSdCard///Navkingdom/log_start_flag_true=/data/data/com.npnd.n200/log_start_flag_true
+/mnt/extSdCard///Navkingdom/UpdateCheck.dat=/data/data/com.npnd.n200/UpdateCheck.dat
+/mnt/extSdCard///Navkingdom/tempBTUpdate=/data/data/com.npnd.n200/tempBTUpdate
+/mnt/extSdCard///Navkingdom/userDist.txt=/data/data/com.npnd.n200/userDist.txt
+/mnt/extSdCard///Navkingdom/npnd_nmea_=/data/data/com.npnd.n200/npnd_nmea_
+/mnt/extSdCard///Navkingdom/meminfo.txt=/data/data/com.npnd.n200/meminfo.txt
+/mnt/extSdCard///Navkingdom/BTDL_TEST=/data/data/com.npnd.n200/BTDL_TEST
+/mnt/extSdCard///Navkingdom/test.txt=/data/data/com.npnd.n200/test.txt
+/mnt/extSdCard///Navkingdom/log_=/data/data/com.npnd.n200/log_
+/mnt/extSdCard///JNI_Exception.log=/data/data/com.npnd.n200/jni.log
+/mnt/extSdCard///BackupResult.txt=/data/data/com.npnd.n200/bk.txt
+/mnt/extSdCard///tombstones/=/data/data/com.npnd.n200/tb/
+/mnt/extSdCard///SnapShot=/data/data/com.npnd.n200/

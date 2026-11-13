@@ -19,6 +19,10 @@
 #                      MUST be exactly 14 bytes -- see tools/patch_paths.py
 #   --keep-dmb         do not swap in the stub (for A/B testing only)
 #   --no-path-patch    leave /mnt/extSdCard alone (if you symlink it on-device)
+#   --writes-to-appdata  keep the map data on the SD card and redirect only the
+#                      paths the app WRITES into /data/data/com.npnd.n200/.
+#                      Fixes the fprintf-on-NULL crash without root and without
+#                      moving gigabytes. See tools/write_redirects.txt.
 #   --strip-dead       delete libskik.so, libcorkscrew.so, libgccdemangle.so and
 #                      gdbserver, which nothing needs once the stub is in place
 #   --store            store entries uncompressed, like the original APK
@@ -37,6 +41,7 @@ DATA_ROOT="/sdcard/n200dt"
 KEEP_DMB=0
 PATH_PATCH=1
 STRIP_DEAD=0
+WRITES_TO_APPDATA=0
 STORE=0
 KEYSTORE="$REPO/keys/n200.jks"
 ALIAS="n200"
@@ -50,6 +55,7 @@ while [ $# -gt 0 ]; do
         --data-root)   DATA_ROOT="$2"; shift 2 ;;
         --keep-dmb)    KEEP_DMB=1; shift ;;
         --no-path-patch) PATH_PATCH=0; shift ;;
+        --writes-to-appdata) WRITES_TO_APPDATA=1; shift ;;
         --strip-dead)  STRIP_DEAD=1; shift ;;
         --store)       STORE=1; shift ;;
         --keystore)    KEYSTORE="$2"; shift 2 ;;
@@ -117,7 +123,12 @@ if [ "$STRIP_DEAD" -eq 1 ]; then
 fi
 
 # -------------------------------------------------------------- data root
-if [ "$PATH_PATCH" -eq 1 ]; then
+if [ "$WRITES_TO_APPDATA" -eq 1 ]; then
+    echo "==> redirecting only the written paths into the app's private directory"
+    echo "    (the map database stays on the SD card where it already is)"
+    python3 "$REPO/tools/patch_paths.py" "$WORK/apk" \
+        --map-file "$REPO/tools/write_redirects.txt" --allow-shorter
+elif [ "$PATH_PATCH" -eq 1 ]; then
     echo "==> repointing the data root at $DATA_ROOT"
     REL="${DATA_ROOT#/}"
     python3 "$REPO/tools/patch_paths.py" "$WORK/apk" \

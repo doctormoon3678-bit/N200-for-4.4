@@ -79,7 +79,14 @@ def patch_bytes_shorter(data: bytes, old: bytes, new: bytes) -> tuple[bytes, int
         tail = bytes(buf[i + len(old):end])
         buf[i:end] = new + tail + b"\x00" * gap
         count += 1
-        pos = i + len(new) + len(tail)
+        # Resume just after the replacement, not after the whole tail. Two paths
+        # can share a single NUL-terminated region -- libHNcommonlib.so has
+        # ".../Persistence/onoff.log" immediately followed by
+        # ".../Persistence/CarDialy/DrivingDistance.dat" with no terminator
+        # between them -- and skipping the tail would leave the second one
+        # unpatched. `old not in new` is checked by the caller, so this cannot
+        # rescan its own output forever.
+        pos = i + len(new)
     return bytes(buf), count
 
 
@@ -98,6 +105,10 @@ def main() -> int:
     ap.add_argument("--map", action="append", default=[], metavar="OLD=NEW",
                     help="path substitution; repeatable. "
                          "default: /mnt/extSdCard=/sdcard/n200dt")
+    ap.add_argument("--map-file", action="append", default=[], metavar="FILE",
+                    help="read OLD=NEW substitutions from FILE, one per line, "
+                         "applied in file order; '#' comments and blank lines "
+                         "are ignored. Repeatable, and combines with --map.")
     ap.add_argument("--allow-shorter", action="store_true",
                     help="permit NEW shorter than OLD (left-shift + NUL pad)")
     ap.add_argument("--dry-run", action="store_true", help="report, change nothing")
@@ -109,8 +120,22 @@ def main() -> int:
         print(f"error: {root} is not a directory", file=sys.stderr)
         return 1
 
+    specs = []
+    for mf in args.map_file:
+        p = pathlib.Path(mf)
+        if not p.is_file():
+            print(f"error: no such map file: {mf}", file=sys.stderr)
+            return 1
+        for raw in p.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line:
+                specs.append(line)
+    specs += args.map
+    if not specs:
+        specs = [f"{o}={n}" for o, n in DEFAULT_MAP]
+
     pairs = []
-    for spec in (args.map or [f"{o}={n}" for o, n in DEFAULT_MAP]):
+    for spec in specs:
         if "=" not in spec:
             print(f"error: --map needs OLD=NEW, got {spec!r}", file=sys.stderr)
             return 1
@@ -129,6 +154,11 @@ def main() -> int:
         if len(new) < len(old) and not args.allow_shorter:
             print(f"error: {new!r} is shorter than {old!r}. Pick an equal-length "
                   f"path ({len(old)} bytes) or pass --allow-shorter.",
+                  file=sys.stderr)
+            return 1
+        if old in new:
+            print(f"error: {old!r} occurs inside its own replacement {new!r}; "
+                  f"the substitution would rescan its own output.",
                   file=sys.stderr)
             return 1
         pairs.append((old.encode(), new.encode()))
@@ -181,9 +211,15 @@ def main() -> int:
 
     if not args.quiet:
         print(f"    ---- {total} occurrences in {touched} files")
-        for old, new in pairs:
-            print(f"    data root: {old.decode()}  ->  {new.decode()}")
-            print(f"    put the map data at {new.decode()}/Navkingdom/...")
+        if len(pairs) <= 2:
+            # A whole-root move: say where the data has to go.
+            for old, new in pairs:
+                print(f"    data root: {old.decode()}  ->  {new.decode()}")
+            print(f"    put the map data at {pairs[0][1].decode()}/Navkingdom/...")
+        else:
+            # A curated per-path list (e.g. tools/write_redirects.txt); printing
+            # "put the map data at ..." for each entry would be nonsense.
+            print(f"    applied {len(pairs)} substitutions")
     if total == 0:
         print("warning: nothing matched; is this the right APK?", file=sys.stderr)
     return 0
