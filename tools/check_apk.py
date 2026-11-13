@@ -12,6 +12,7 @@ So the checks here are the ones that would have caught that, plus the cheap
 structural checks worth having around it:
 
   * every dex string's declared utf16_size matches its content
+  * the dex string table is still sorted (dexopt rejects it otherwise)
   * the dex adler32 checksum and SHA-1 signature match
   * every native library is still a parseable 32-bit ARM ELF
   * the zip itself is intact and holds the files an APK needs
@@ -39,7 +40,7 @@ import zipfile
 import zlib
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from patch_paths import verify_dex_strings  # noqa: E402
+from patch_paths import verify_dex_order, verify_dex_strings  # noqa: E402
 
 REQUIRED = ["AndroidManifest.xml", "classes.dex", "resources.arsc"]
 # Digests Android's v1 verifier handles at API 19. SHA-512 is API 21+, and
@@ -111,14 +112,22 @@ def main() -> int:
             if chk != struct.unpack_from("<I", d, 8)[0]:
                 bad(f"{dex.name} adler32 checksum does not match its content")
             problems = verify_dex_strings(d)
+            order = verify_dex_order(d)
             if problems:
                 bad(f"{dex.name}: {len(problems)} strings whose declared "
                     f"utf16_size disagrees with their content -- dexopt will "
                     f"reject this at install time")
                 for p in problems[:8]:
                     print(f"          {p}")
-            else:
-                ok(f"{dex.name} string table, checksum and signature consistent")
+            if order:
+                bad(f"{dex.name}: string_ids are no longer sorted "
+                    f"({len(order)} violation(s)) -- dexopt will reject this at "
+                    f"install time")
+                for p in order[:8]:
+                    print(f"          {p}")
+            if not problems and not order:
+                ok(f"{dex.name} string table sorted and consistent, "
+                   f"checksum and signature match")
 
         # ------------------------------------------------------------ elf
         readelf = shutil.which("readelf") or shutil.which("llvm-readelf")

@@ -126,8 +126,13 @@ fi
 if [ "$WRITES_TO_APPDATA" -eq 1 ]; then
     echo "==> redirecting only the written paths into the app's private directory"
     echo "    (the map database stays on the SD card where it already is)"
+    # --skip-dex: classes.dex must not be touched. Its string table is sorted,
+    # and /data/... sorts before /mnt/..., so rewriting a path in place breaks
+    # the ordering that Dalvik's dexopt verifies at install time. The Java side
+    # only checks that the Persistence folder exists, which it still does on the
+    # card; the writes that actually crash are all in the native libraries.
     python3 "$REPO/tools/patch_paths.py" "$WORK/apk" \
-        --map-file "$REPO/tools/write_redirects.txt" --allow-shorter
+        --map-file "$REPO/tools/write_redirects.txt" --allow-shorter --skip-dex
 elif [ "$PATH_PATCH" -eq 1 ]; then
     echo "==> repointing the data root at $DATA_ROOT"
     REL="${DATA_ROOT#/}"

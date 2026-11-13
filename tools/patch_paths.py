@@ -189,6 +189,36 @@ def verify_dex_strings(data: bytes) -> list[str]:
     return problems
 
 
+def verify_dex_order(data: bytes) -> list[str]:
+    """string_ids must be sorted by content, in UTF-16 code point order.
+
+    The dex format requires it and Dalvik's dexSwapAndVerify checks it while
+    dexopt runs at install time, so a violation shows up only as the install
+    failing. This is why a path inside a dex cannot be rewritten in place once
+    the replacement sorts to a different position: '/data/...' lands before
+    '/mnt/...', and re-sorting the table would mean remapping every string index
+    referenced by type_ids, method_ids, class_defs and every const-string in the
+    bytecode -- a full dex rewrite.
+    """
+    problems = []
+    count, ids_off = struct.unpack_from("<II", data, 56)
+
+    def read(i: int) -> str:
+        off = struct.unpack_from("<I", data, ids_off + 4 * i)[0]
+        _, n = _uleb(data, off)
+        p = off + n
+        return data[p:data.index(b"\x00", p)].decode("utf-8", "replace")
+
+    prev = read(0) if count else ""
+    for i in range(1, count):
+        cur = read(i)
+        if [ord(c) for c in prev] >= [ord(c) for c in cur]:
+            problems.append(f"string_ids out of order at {i}: "
+                            f"{prev!r} then {cur!r}")
+        prev = cur
+    return problems
+
+
 def fix_dex_header(data: bytes) -> bytes:
     """Recompute dex signature (SHA-1 of [32:]) then checksum (adler32 of [12:])."""
     buf = bytearray(data)
@@ -210,6 +240,10 @@ def main() -> int:
                          "are ignored. Repeatable, and combines with --map.")
     ap.add_argument("--allow-shorter", action="store_true",
                     help="permit NEW shorter than OLD (left-shift + NUL pad)")
+    ap.add_argument("--skip-dex", action="store_true",
+                    help="leave classes.dex alone and patch only the native "
+                         "libraries. Needed whenever a replacement would sort "
+                         "to a different position in the dex string table.")
     ap.add_argument("--dry-run", action="store_true", help="report, change nothing")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -263,8 +297,8 @@ def main() -> int:
         pairs.append((old.encode(), new.encode()))
 
     targets = sorted(root.glob("lib/*/*.so"))
-    dex = sorted(root.glob("classes*.dex"))
-    targets += dex
+    if not args.skip_dex:
+        targets += sorted(root.glob("classes*.dex"))
     arsc = root / "resources.arsc"
     if arsc.exists():
         targets.append(arsc)
@@ -295,13 +329,16 @@ def main() -> int:
             continue
         if is_dex:
             data = fix_dex_header(data)
-            problems = verify_dex_strings(data)
+            problems = verify_dex_strings(data) + verify_dex_order(data)
             if problems:
-                print(f"error: {path.name} is corrupt after patching "
-                      f"({len(problems)} bad strings). Android would refuse to "
-                      f"install it:", file=sys.stderr)
+                print(f"error: {path.name} would be rejected at install time "
+                      f"({len(problems)} problem(s)):", file=sys.stderr)
                 for p in problems[:10]:
                     print(f"    {p}", file=sys.stderr)
+                print("\n       A dex string cannot be rewritten in place when the\n"
+                      "       replacement sorts to a different position. Pass\n"
+                      "       --skip-dex to leave classes.dex alone and patch only\n"
+                      "       the native libraries.", file=sys.stderr)
                 return 1
         if path.name == "resources.arsc":
             # Equal-length only; arsc string pools are length-prefixed and we do
