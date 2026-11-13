@@ -201,10 +201,13 @@ Three things make this better than rewriting the strings, beyond lifting the
 * **The split is decided per call, from the open mode** — not from a list of
   paths. A write can therefore not be missed, and a missed write is precisely
   what the tombstone above was.
-* **The card is found on the device**, by looking for a `Navkingdom` directory
-  under the mount points vendors actually use. The same APK works on a phone
-  that calls the card `/storage/sdcard1` and one that calls it
-  `/storage/extSdCard`.
+* **The card is found on the device**, by reading `/proc/mounts` and looking
+  for a `Navkingdom` directory under each mounted filesystem. A card is a real
+  mount, so whatever the vendor called its mount point — `/storage/extSdCard`,
+  `/mnt/extsdcard`, `/storage/sdcard1` — it is in that table, and no list of
+  guessed names has to be right. A list of known names is still tried
+  afterwards, because a card reached through a *symlink* is not a mount and
+  does not appear there.
 * **Missing write directories are created on demand.** The app assumes its tree
   already exists and never calls `mkdir` for most of it.
 
@@ -239,10 +242,28 @@ adb logcat -d -s n200fs
 ```
 
 ```
+I/n200fs  : mounted storage: /storage/emulated/0 /storage/extSdCard
 I/n200fs  : read  root: /storage/extSdCard
 I/n200fs  : write root: /sdcard/n200dt
 I/n200fs  : /mnt/extSdCard -> the two roots above
 ```
+
+Without a desktop, the same three facts are written to
+**`/sdcard/n200dt/n200fs.log`**, readable with any file manager on the phone:
+
+```
+n200fs
+redirecting /mnt/extSdCard
+  reads  -> /storage/extSdCard
+  writes -> /sdcard/n200dt
+
+mounted storage:
+  /storage/emulated/0 /storage/extSdCard
+```
+
+If that file does not appear at all, the library is not being loaded and the
+problem is not the card. If it appears and `reads` is wrong, `mounted storage`
+says what the device actually has.
 
 If the read root is wrong — a card this build has not heard of, or two cards —
 name it yourself. No rebuild, and it takes effect at the next start:
@@ -555,10 +576,12 @@ Not verified:
 
   and the fallback is the string-rewrite build (`tools/repack.sh --keep-dmb`,
   everything on internal storage), which does not use any of this.
-* **Which mount points real devices use.** The candidate list in
-  `shim/n200fs.c` covers the names vendors are known to use, but it is a list,
-  not a survey. `adb logcat -s n200fs` says which one was taken, and
-  `n200fs.conf` overrides it without a rebuild.
+* **Which mount points real devices use.** `/proc/mounts` makes this mostly
+  moot — a card is a mount, so it is in the table whatever it is called — but
+  a card reachable only through a symlink still depends on the fallback list
+  being right. `n200fs.log` and `adb logcat -s n200fs` both print the mount
+  table that was found, and `n200fs.conf` overrides the choice without a
+  rebuild.
 * **The Java half is not redirected.** `java.io.File` goes through libjavacore,
   which this library is not in front of, so the few paths `classes.dex` holds
   still read `/mnt/extSdCard`. None of them block startup:

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -177,7 +178,21 @@ int main(int argc, char **argv)
     ck(!exists("%s/Navkingdom/Persistence/probe.txt", WRITE, 0),
        "  and it removed the right file");
 
-    /* 9. paths that are not the app's root must be passed through untouched */
+    /* 9. the on-device diagnostic: whoever installs this may have a file
+     *    manager rather than adb, so the roots are left in a file too */
+    snprintf(buf, sizeof buf, "%s/n200fs.log", WRITE);
+    {
+        char log[1024];
+        int n = slurp(buf, log, sizeof log);
+        ck(n > 0, "n200fs.log is written next to the data");
+        ck(n > 0 && strstr(log, CARD) != NULL,
+           "  and names the read root");
+        ck(n > 0 && strstr(log, "mounted storage") != NULL &&
+           strstr(log, "unreadable") == NULL,
+           "  and lists the mount points, whichever root was chosen");
+    }
+
+    /* 10. paths that are not the app's root must be passed through untouched */
     f = n200_fopen("/etc/hostname", "r");
     ck(f != NULL, "an unrelated absolute path is not redirected");
     if (f) fclose(f);

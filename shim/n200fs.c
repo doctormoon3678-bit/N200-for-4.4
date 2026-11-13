@@ -170,15 +170,27 @@ static int   (*r_rename)(const char *, const char *);
 static int   (*r_utimes)(const char *, const void *);
 static int   (*r_statfs)(const char *, void *);
 static int   (*r_system)(const char *);
+static int   (*r_read)(int, void *, u32);
+static int   (*r_write)(int, const void *, u32);
+static int   (*r_close)(int);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
+static char g_mounts[512];       /* storage mount points, for the log      */
 static volatile int g_ready;     /* 1 once both roots are usable           */
 static volatile int g_busy;      /* re-entry guard for the resolve step    */
 
-/* Mount points to look for the card at, best guess first. The app's own
- * /mnt/extSdCard is included: on a head unit, and on some older builds, it
- * really is the mount point. */
+/*
+ * Fallback mount points, used after /proc/mounts has been searched. These are
+ * worth keeping even though the mount table is authoritative, because a card
+ * is often reachable through a symlink or an alias that is not itself a mount
+ * -- /mnt/extsdcard pointing at /storage/extSdCard, say -- and such a name
+ * never appears in /proc/mounts.
+ *
+ * Case matters here: these are real directory names in a tmpfs, not entries on
+ * the card's own case-insensitive filesystem, so extSdCard and extsdcard are
+ * two different paths and both have shipped on real devices.
+ */
 static const char *const CANDIDATES[] = {
     "/storage/extSdCard",
     "/storage/extsdcard",
@@ -192,12 +204,20 @@ static const char *const CANDIDATES[] = {
     "/storage/microsd",
     "/storage/sdcard-ext",
     "/storage/removable/sdcard1",
+    "/storage/removable/microsd",
     "/storage/usbcard1",
+    "/mnt/extsdcard",
     "/mnt/extSdCard",
+    "/mnt/ExtSdCard",
     "/mnt/external_sd",
+    "/mnt/externalSD",
     "/mnt/ext_sd",
-    "/mnt/sdcard/external_sd",
+    "/mnt/sdcard1",
     "/mnt/sdcard2",
+    "/mnt/sdcard-ext",
+    "/mnt/sdcard/external_sd",
+    "/mnt/sdcard/extStorages/SdCard",
+    "/mnt/emmc",
     "/mnt/media_rw/extSdCard",
     "/mnt/media_rw/sdcard1",
     0
@@ -242,24 +262,32 @@ static void make_parents(const char *path)
 
 /* ---- configuration ----------------------------------------------------- */
 
-/* Read "data=" / "write=" from a n200fs.conf, if one is there. Hand-parsed
- * so that no stdio call can re-enter this library. */
+/* Read a whole small file. Returns the byte count, or -1. Uses the raw
+ * descriptor calls, not stdio, so nothing here can re-enter this library. */
+static int read_file(const char *path, char *buf, int cap)
+{
+    int fd, n, total = 0;
+    if (!r_open || !r_read) return -1;
+    fd = r_open(path, 0 /* O_RDONLY */, 0);
+    if (fd < 0) return -1;
+    /* /proc files do not report a size and can come back in short reads. */
+    while (total < cap - 1) {
+        n = r_read(fd, buf + total, (u32)(cap - 1 - total));
+        if (n <= 0) break;
+        total += n;
+    }
+    if (r_close) r_close(fd);
+    buf[total] = 0;
+    return total;
+}
+
+/* Read "data=" / "write=" from a n200fs.conf, if one is there. */
 static void read_conf(const char *path)
 {
     char buf[1024];
-    int fd, n, i, start;
-    if (!r_open) return;
-    fd = r_open(path, 0 /* O_RDONLY */, 0);
-    if (fd < 0) return;
-    {
-        int (*r_read)(int, void *, u32) =
-            (int (*)(int, void *, u32))dlsym(RTLD_DEFAULT, "read");
-        int (*r_close)(int) = (int (*)(int))dlsym(RTLD_DEFAULT, "close");
-        n = r_read ? r_read(fd, buf, (u32)(sizeof buf - 1)) : -1;
-        if (r_close) r_close(fd);
-    }
+    int n, i, start;
+    n = read_file(path, buf, (int)sizeof buf);
     if (n <= 0) return;
-    buf[n] = 0;
     LOGI("reading %s", path);
 
     start = 0;
@@ -286,6 +314,102 @@ static void read_conf(const char *path)
     s_trim(g_write);
 }
 
+/* Does <root>/Navkingdom exist, or <root>/n200dt/Navkingdom? Returns 1 and
+ * fills g_data on a hit. */
+static int try_root(const char *root)
+{
+    char buf[PATHMAX];
+    if (!root || !root[0]) return 0;
+    if (join(buf, sizeof buf, root, "Navkingdom") && is_dir(buf)) {
+        s_copy(g_data, sizeof g_data, root);
+        return 1;
+    }
+    if (join(buf, sizeof buf, root, "n200dt/Navkingdom") && is_dir(buf)) {
+        int n = 0;
+        g_data[0] = 0;
+        s_cat(g_data, sizeof g_data, &n, root);
+        s_cat(g_data, sizeof g_data, &n, "/n200dt");
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Search the mount table for the card.
+ *
+ * This is what makes the library work on a device nobody anticipated. A card
+ * is a real filesystem, so whatever the vendor decided to call its mount point
+ * -- /storage/extSdCard, /mnt/extsdcard, /storage/sdcard1 -- it is listed in
+ * /proc/mounts, and a list of guessed names is not needed to find it.
+ *
+ * Parsed by hand from the raw bytes: field 2 of each line is the mount point.
+ * Nothing but open/read/close is involved, so there is no structure layout to
+ * get wrong and no stdio call that could re-enter this library.
+ *
+ * Mount points are also logged, because when this fails they are the one thing
+ * needed to say why.
+ */
+static int scan_mounts(const char *primary, int probe)
+{
+    char buf[8192];
+    int listn = 0;
+    int n, i, found = 0;
+    int pass;
+
+    n = read_file("/proc/mounts", buf, (int)sizeof buf);
+    if (n <= 0) {
+        s_copy(g_mounts, sizeof g_mounts, "(/proc/mounts unreadable)");
+        LOGI("/proc/mounts is unreadable; falling back to known mount points");
+        return 0;
+    }
+    g_mounts[0] = 0;
+
+    /* Pass 0 takes anything that is not primary storage, so a card wins over
+     * the built-in storage even when both carry a Navkingdom. Pass 1 then
+     * allows primary. */
+    for (pass = 0; pass < 2 && !found; pass++) {
+        int start = 0;
+        for (i = 0; i <= n; i++) {
+            char mp[PATHMAX];
+            int k = 0, field = 0, j;
+            if (buf[i] != '\n' && buf[i] != 0) continue;
+            /* skip to field 2 (the mount point) */
+            for (j = start; j < i && field < 1; j++)
+                if (buf[j] == ' ') field++;
+            for (; j < i && buf[j] != ' ' && k + 1 < (int)sizeof mp; j++) {
+                /* /proc/mounts escapes a space as \040 */
+                if (buf[j] == '\\' && j + 3 < i && buf[j + 1] == '0' &&
+                    buf[j + 2] == '4' && buf[j + 3] == '0') {
+                    mp[k++] = ' ';
+                    j += 3;
+                } else {
+                    mp[k++] = buf[j];
+                }
+            }
+            mp[k] = 0;
+            start = i + 1;
+
+            /* Only storage-shaped mount points are worth a syscall. */
+            if (s_ncmp(mp, "/storage", 8) != 0 && s_ncmp(mp, "/mnt", 4) != 0)
+                continue;
+            if (pass == 0 && s_ncmp(mp, primary, s_len(primary)) == 0 &&
+                s_len(mp) == s_len(primary))
+                continue;
+
+            if (pass == 0 && listn + k + 2 < (int)sizeof g_mounts) {
+                if (listn) s_cat(g_mounts, sizeof g_mounts, &listn, " ");
+                s_cat(g_mounts, sizeof g_mounts, &listn, mp);
+            }
+            if (probe && try_root(mp)) {
+                found = 1;
+                break;
+            }
+        }
+    }
+    if (g_mounts[0]) LOGI("mounted storage: %s", g_mounts);
+    return found;
+}
+
 /* Decide where reads and writes go. */
 static void pick_roots(void)
 {
@@ -309,39 +433,65 @@ static void pick_roots(void)
     make_parents(g_write);
     if (r_mkdir) r_mkdir(g_write, 0775);
 
-    if (g_data[0]) return;          /* set from n200fs.conf */
-
-    /* Look for the map tree. A root "contains Navkingdom" either directly or
-     * one level down in n200dt, which is where older repacks of this APK put
-     * it. */
-    for (i = 0; CANDIDATES[i]; i++) {
-        if (join(buf, sizeof buf, CANDIDATES[i], "Navkingdom") && is_dir(buf)) {
-            s_copy(g_data, sizeof g_data, CANDIDATES[i]);
-            return;
-        }
-        if (join(buf, sizeof buf, CANDIDATES[i], "n200dt/Navkingdom") &&
-            is_dir(buf)) {
-            int n = 0;
-            g_data[0] = 0;
-            s_cat(g_data, sizeof g_data, &n, CANDIDATES[i]);
-            s_cat(g_data, sizeof g_data, &n, "/n200dt");
-            return;
-        }
+    if (g_data[0]) {                /* set from n200fs.conf */
+        scan_mounts(primary, 0);    /* collect the list for the log only */
+        if (join(buf, sizeof buf, g_data, "Navkingdom") && !is_dir(buf))
+            LOGE("n200fs.conf says data=%s but %s is not a directory",
+                 g_data, buf);
+        return;
     }
+
+    /* The mount table knows what is actually mounted, whatever it is called. */
+    if (scan_mounts(primary, 1)) return;
+
+    /* Then the known names, which also catch a card reached through a symlink
+     * -- those are not mounts and are not in /proc/mounts. */
+    for (i = 0; CANDIDATES[i]; i++)
+        if (try_root(CANDIDATES[i])) return;
+
     /* Nothing on a card: fall back to primary storage, which is what a build
      * without this library would have used anyway. */
-    if (join(buf, sizeof buf, primary, "n200dt/Navkingdom") && is_dir(buf)) {
-        int n = 0;
-        g_data[0] = 0;
-        s_cat(g_data, sizeof g_data, &n, primary);
-        s_cat(g_data, sizeof g_data, &n, "/n200dt");
-        return;
-    }
-    if (join(buf, sizeof buf, primary, "Navkingdom") && is_dir(buf)) {
-        s_copy(g_data, sizeof g_data, primary);
-        return;
-    }
+    if (try_root(primary)) return;
+
+    LOGE("no Navkingdom directory found on any mounted storage.");
+    LOGE("Put the map tree at <card>/Navkingdom, or name the card yourself:");
+    LOGE("  echo data=/your/card > %s/n200fs.conf", g_write);
     s_copy(g_data, sizeof g_data, g_write);
+}
+
+/*
+ * Leave the same three facts in a file next to the data, as well as in
+ * logcat. Whoever is installing this is as likely to be holding the phone with
+ * a file manager open as to have adb on a desktop, and when the card is not
+ * found the mount list is the one thing needed to say why.
+ */
+static void write_log(void)
+{
+    char path[PATHMAX], out[1024];
+    int fd, n = 0;
+
+    if (!r_open || !r_write) return;
+    if (!join(path, sizeof path, g_write, "n200fs.log")) return;
+
+    out[0] = 0;
+    s_cat(out, sizeof out, &n, "n200fs\nredirecting ");
+    s_cat(out, sizeof out, &n, PFX);
+    s_cat(out, sizeof out, &n, "\n  reads  -> ");
+    s_cat(out, sizeof out, &n, g_data);
+    s_cat(out, sizeof out, &n, "\n  writes -> ");
+    s_cat(out, sizeof out, &n, g_write);
+    s_cat(out, sizeof out, &n, "\n\nmounted storage:\n  ");
+    s_cat(out, sizeof out, &n, g_mounts[0] ? g_mounts : "(/proc/mounts unreadable)");
+    s_cat(out, sizeof out, &n,
+          "\n\nIf 'reads' is wrong, put the map tree at <card>/Navkingdom,\n"
+          "or name the card in n200fs.conf next to this file:\n"
+          "  data=/your/card\n");
+
+    /* O_WRONLY|O_CREAT|O_TRUNC. Generic Linux values, the same on ARM. */
+    fd = r_open(path, 1 | 0100 | 01000, 0644);
+    if (fd < 0) return;
+    r_write(fd, out, (u32)n);
+    if (r_close) r_close(fd);
 }
 
 static void resolve(void)
@@ -364,6 +514,7 @@ static void resolve(void)
     GET(fopen); GET(open); GET(stat); GET(access); GET(opendir);
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
+    GET(read); GET(write); GET(close);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -384,6 +535,7 @@ static void resolve(void)
     LOGI("read  root: %s", g_data);
     LOGI("write root: %s", g_write);
     LOGI("%s -> the two roots above", PFX);
+    write_log();
 
     g_ready = 1;
     g_busy = 0;

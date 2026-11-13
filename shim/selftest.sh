@@ -74,6 +74,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 1b. The card is at a mount point no list could have guessed. Only
+#     /proc/mounts can find this one -- "/mnt/weird_card_xyz" is deliberately
+#     not in CANDIDATES -- so this is what proves the mount-table search works
+#     and not merely the fallback list. Needs to be able to mount, so it is
+#     skipped where that is not permitted.
+MP=/mnt/weird_card_xyz
+if mkdir -p "$MP" 2>/dev/null &&
+   mkdir -p "$WORK/bindsrc" &&
+   mount --bind "$WORK/bindsrc" "$MP" 2>/dev/null; then
+    fixture "$MP"
+    mkdir -p "$WORK/primary1b"
+    run "card found through /proc/mounts at $MP" "$MP" "$WORK/primary1b" || rc=1
+    umount "$MP" 2>/dev/null || true
+    rmdir "$MP" 2>/dev/null || true
+else
+    echo "== card found through /proc/mounts"
+    echo "  skip  cannot bind-mount here"
+    echo
+    rmdir "$MP" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
 # 2. n200fs.conf names a card this build has never heard of.
 mkdir -p "$WORK/primary2/n200dt" "$WORK/oddcard"
 fixture "$WORK/oddcard"
