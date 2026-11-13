@@ -153,6 +153,32 @@ report failure instead, so the engine takes its own error path:
 STUB_START_FAILS=1 stub/build.sh && tools/repack.sh --strip-dead
 ```
 
+## Building on GitHub Actions
+
+`.github/workflows/build-stub.yml` builds the stub and runs every gate, so you
+do not need an NDK locally. It runs on pushes that touch `stub/`, and can be
+started by hand from the Actions tab (**build stub** → *Run workflow*), where
+`ndk_version` defaults to `r21e`.
+
+One run produces all three variants in a single artifact — `default`, `trace`
+and `start-fails` — so debugging on the device does not need another run:
+
+```sh
+gh run download --name libstagefright_dmb-stub-r21e
+tools/repack.sh --strip-dead --stub default/libstagefright_dmb.so
+```
+
+The job log also prints the finished library's `DT_NEEDED` list, SONAME,
+exported symbols and ARM build attributes, which is the evidence that the swap
+is sound.
+
+**Repacking is deliberately not in CI.** This repository is public, and so are
+its Actions artifacts and logs. Committing `n200_signed.apk`, fetching it during
+a run, or uploading a repacked copy would publish a commercial navigation app
+and its map engine to anyone who finds the repo. So CI stops at the stub — the
+one piece that is this project's own code — and `tools/repack.sh` stays local.
+Make the repository private and the repack job becomes safe to add.
+
 ## Tools
 
 | | |
@@ -161,6 +187,7 @@ STUB_START_FAILS=1 stub/build.sh && tools/repack.sh --strip-dead
 | `stub/build.sh` | builds and gates the stub (symbol set, SONAME, dependencies) |
 | `tools/audit.py` | prints the `System.loadLibrary` sequence from `classes.dex` and marks which loads reach private ABI — tells you *where* startup dies |
 | `tools/verify_abi.py` | acceptance test: private symbols, private `DT_NEEDED`, architecture. Exit 0 only when clean |
+| `tools/check_mangling.sh` | fast gate: host-compiles the stub and checks the mangled names, no NDK needed |
 | `tools/patch_paths.py` | rewrites the hard-coded data root in the `.so` files and `classes.dex` |
 | `tools/repack.sh` | the whole pipeline, with the audit as a release gate |
 

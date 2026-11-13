@@ -1,0 +1,130 @@
+name: build stub
+
+# Builds and gates the replacement libstagefright_dmb.so.
+#
+# WHAT IS NOT HERE, AND WHY
+# -------------------------
+# Repacking the APK is deliberately left out of CI. This repository is public,
+# and so are its Actions artifacts and logs: putting n200_signed.apk into the
+# repo, downloading it during a run, or uploading a repacked copy would publish
+# a commercial navigation app and its map engine to anyone. Run tools/repack.sh
+# locally instead, with the stub this workflow produces.
+#
+# If the repository is made private, the repack job becomes safe to add.
+
+on:
+  push:
+    paths:
+      - 'stub/**'
+      - 'tools/check_mangling.sh'
+      - '.github/workflows/build-stub.yml'
+  pull_request:
+    paths:
+      - 'stub/**'
+      - 'tools/check_mangling.sh'
+      - '.github/workflows/build-stub.yml'
+  workflow_dispatch:
+    inputs:
+      ndk_version:
+        description: >-
+          NDK release. Must still support android-19: r21e is the last
+          comfortable one, and r23+ raised the minimum to API 21.
+        type: string
+        default: r21e
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast gate. Itanium mangling is architecture-independent, so the host
+  # compiler answers "do these 16 symbols come out right?" in seconds, before
+  # anything spends three minutes fetching an NDK.
+  mangle-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint the scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in stub/build.sh tools/*.sh; do bash -n "$f" && echo "  ok  $f"; done
+          python3 -m py_compile tools/*.py && echo "  ok  tools/*.py"
+
+      - name: Symbols must match what the app imports
+        run: tools/check_mangling.sh
+
+  stub:
+    needs: mangle-check
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: ${{ inputs.ndk_version || 'r21e' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ndk/android-ndk-${{ env.NDK_VERSION }}
+          key: ndk-${{ env.NDK_VERSION }}-linux-x86_64
+
+      - name: Fetch the NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ndk"
+          cd "$RUNNER_TEMP/ndk"
+          url="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux-x86_64.zip"
+          echo "downloading $url"
+          curl -fsSL --retry 3 -o ndk.zip "$url"
+          unzip -q ndk.zip
+          rm ndk.zip
+          ls -d "android-ndk-${NDK_VERSION}"
+
+      - name: Build every stub variant
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_HOME="$RUNNER_TEMP/ndk/android-ndk-${NDK_VERSION}"
+
+          # One NDK, three builds. The tracing stub is what you want on the
+          # device when the engine misbehaves, so ship it alongside by default
+          # rather than making someone re-run the workflow to get it.
+          build() {
+            local name="$1"; shift
+            echo
+            echo "================ $name ================"
+            env "$@" stub/build.sh
+            mkdir -p "artifacts/$name"
+            cp stub/out/libstagefright_dmb.so "artifacts/$name/"
+          }
+
+          build default      STUB_TRACE=0 STUB_START_FAILS=0
+          build trace        STUB_TRACE=1 STUB_START_FAILS=0
+          build start-fails  STUB_TRACE=1 STUB_START_FAILS=1
+
+      - name: Show what came out
+        shell: bash
+        run: |
+          set -euo pipefail
+          READELF="$(ls "$RUNNER_TEMP"/ndk/android-ndk-"$NDK_VERSION"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)"
+          for so in artifacts/*/libstagefright_dmb.so; do
+            echo "=============================================================="
+            echo "$so  ($(stat -c%s "$so") bytes; the original was 2349248)"
+            "$READELF" -h "$so" | grep -E 'Class|Machine|Type:'
+            echo "-- DT_NEEDED / SONAME --"
+            "$READELF" -d "$so" | grep -E 'NEEDED|SONAME'
+            echo "-- exported --"
+            "$READELF" -sW --dyn-syms "$so" \
+              | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){print "   "$8}' | sort -u
+            echo "-- ARM build attributes --"
+            "$READELF" -A "$so" | grep -E 'Tag_CPU_arch|Tag_FP_arch|Tag_ABI_VFP' || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libstagefright_dmb-stub-${{ env.NDK_VERSION }}
+          path: artifacts/
+          if-no-files-found: error
