@@ -39,6 +39,7 @@ Usage:
 import argparse
 import hashlib
 import pathlib
+import struct
 import sys
 import zlib
 
@@ -88,6 +89,104 @@ def patch_bytes_shorter(data: bytes, old: bytes, new: bytes) -> tuple[bytes, int
         # rescan its own output forever.
         pos = i + len(new)
     return bytes(buf), count
+
+
+def _uleb(data: bytes, o: int) -> tuple[int, int]:
+    """Read a ULEB128. Returns (value, byte_count)."""
+    r = s = 0
+    n = 0
+    while True:
+        b = data[o + n]
+        n += 1
+        r |= (b & 0x7F) << s
+        if not b & 0x80:
+            return r, n
+        s += 7
+
+
+def _uleb_encode(v: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = v & 0x7F
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def patch_dex(data: bytes, pairs, allow_shorter: bool) -> tuple[bytes, int, str | None]:
+    """Substitute inside a dex by walking its string table.
+
+    A dex string is `uleb128 utf16_size` followed by NUL-terminated MUTF-8, so a
+    blind byte replace that shortens the content leaves utf16_size too large.
+    Dalvik runs dexopt at install time on Android 4.4 and rejects the file, which
+    shows up simply as the install failing. So rewrite the length prefix too.
+
+    Both sides of every substitution are ASCII, so the change in UTF-16 code
+    units equals the change in bytes; no MUTF-8 arithmetic is needed.
+
+    Returns (data, hits, error).
+    """
+    buf = bytearray(data)
+    count, ids_off = struct.unpack_from("<II", data, 56)
+    hits = 0
+    for i in range(count):
+        str_off = struct.unpack_from("<I", data, ids_off + 4 * i)[0]
+        declared, uleb_len = _uleb(data, str_off)
+        dstart = str_off + uleb_len
+        dend = data.index(b"\x00", dstart)
+        old = bytes(data[dstart:dend])
+        new = old
+        for o, n in pairs:
+            if o in new:
+                new = new.replace(o, n)
+        if new == old:
+            continue
+        if len(new) > len(old):
+            return bytes(buf), hits, (
+                f"string {i} would grow ({len(old)} -> {len(new)} bytes), which "
+                f"would move every later dex offset")
+        if len(new) < len(old) and not allow_shorter:
+            return bytes(buf), hits, (
+                f"string {i} would shrink and --allow-shorter was not given")
+        new_declared = declared - (len(old) - len(new))
+        new_uleb = _uleb_encode(new_declared)
+        if len(new_uleb) != uleb_len:
+            return bytes(buf), hits, (
+                f"string {i}: the length prefix would change size "
+                f"({uleb_len} -> {len(new_uleb)} bytes), which would move "
+                f"later dex offsets")
+        buf[str_off:str_off + uleb_len] = new_uleb
+        buf[dstart:dend] = new + b"\x00" * (len(old) - len(new))
+        hits += 1
+    return bytes(buf), hits, None
+
+
+def verify_dex_strings(data: bytes) -> list[str]:
+    """Every string's declared utf16_size must match its content.
+
+    This is the check that would have caught the install failure caused by
+    shortening dex strings without fixing their length prefixes.
+    """
+    problems = []
+    count, ids_off = struct.unpack_from("<II", data, 56)
+    for i in range(count):
+        str_off = struct.unpack_from("<I", data, ids_off + 4 * i)[0]
+        declared, uleb_len = _uleb(data, str_off)
+        dstart = str_off + uleb_len
+        dend = data.index(b"\x00", dstart)
+        raw = bytes(data[dstart:dend])
+        try:
+            actual = len(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            problems.append(f"string {i} is not decodable: {raw[:60]!r}")
+            continue
+        if actual != declared:
+            problems.append(
+                f"string {i} declares {declared} but holds {actual}: {raw[:60]!r}")
+    return problems
 
 
 def fix_dex_header(data: bytes) -> bytes:
@@ -179,16 +278,31 @@ def main() -> int:
     for path in targets:
         data = original = path.read_bytes()
         hits = 0
-        for old, new in pairs:
-            if len(new) == len(old):
-                data, n = patch_bytes_equal(data, old, new)
-            else:
-                data, n = patch_bytes_shorter(data, old, new)
-            hits += n
+        is_dex = path.name.startswith("classes") and path.suffix == ".dex"
+        if is_dex:
+            data, hits, err = patch_dex(data, pairs, args.allow_shorter)
+            if err:
+                print(f"error: {path.name}: {err}", file=sys.stderr)
+                return 1
+        else:
+            for old, new in pairs:
+                if len(new) == len(old):
+                    data, n = patch_bytes_equal(data, old, new)
+                else:
+                    data, n = patch_bytes_shorter(data, old, new)
+                hits += n
         if not hits:
             continue
-        if path.name.startswith("classes") and path.suffix == ".dex":
+        if is_dex:
             data = fix_dex_header(data)
+            problems = verify_dex_strings(data)
+            if problems:
+                print(f"error: {path.name} is corrupt after patching "
+                      f"({len(problems)} bad strings). Android would refuse to "
+                      f"install it:", file=sys.stderr)
+                for p in problems[:10]:
+                    print(f"    {p}", file=sys.stderr)
+                return 1
         if path.name == "resources.arsc":
             # Equal-length only; arsc string pools are length-prefixed and we do
             # not rewrite them. Flag it rather than silently risking it.

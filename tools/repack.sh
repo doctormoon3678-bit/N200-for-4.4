@@ -198,6 +198,19 @@ if unzip -p "$OUT" META-INF/MANIFEST.MF | grep -qE "SHA-(384|512)-Digest"; then
 fi
 echo "    digest: $(unzip -p "$OUT" META-INF/MANIFEST.MF | grep -m1 -oE 'SHA-?[0-9]*-Digest')"
 
+# -------------------------------------------------------------- structural gate
+# This is a hard gate, unlike the ABI audit below. It catches the class of bug
+# that produces a silent "install failed" -- notably a dex whose string length
+# prefixes no longer match its content, which still checksums and signs cleanly.
+echo
+if ! python3 "$REPO/tools/check_apk.py" "$OUT" --original "$APK"; then
+    echo
+    echo "error: the repacked APK is structurally broken; refusing to ship it." >&2
+    mv -f "$OUT" "$OUT.rejected"
+    echo "       moved to $OUT.rejected for inspection." >&2
+    exit 1
+fi
+
 # -------------------------------------------------------------- audit
 if [ "$VERIFY" -eq 1 ]; then
     echo
