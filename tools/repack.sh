@@ -26,9 +26,8 @@
 #   --strip-dead       delete libskik.so, libcorkscrew.so, libgccdemangle.so and
 #                      gdbserver, which nothing needs once the stub is in place
 #   --store            store entries uncompressed, like the original APK
-#   --keystore PATH    signing keystore    (default keys/n200.jks, auto-created)
-#   --alias NAME       key alias           (default n200)
-#   --storepass PASS   store password      (default n200key)
+#   --key PATH         PEM private key     (default keys/n200.key.pem, auto-created)
+#   --cert PATH        PEM certificate     (default keys/n200.cert.pem, auto-created)
 #   --no-verify        skip the final audit
 set -euo pipefail
 
@@ -43,9 +42,8 @@ PATH_PATCH=1
 STRIP_DEAD=0
 WRITES_TO_APPDATA=0
 STORE=0
-KEYSTORE="$REPO/keys/n200.jks"
-ALIAS="n200"
-STOREPASS="n200key"
+KEY_PEM="$REPO/keys/n200.key.pem"
+CERT_PEM="$REPO/keys/n200.cert.pem"
 VERIFY=1
 
 while [ $# -gt 0 ]; do
@@ -58,9 +56,8 @@ while [ $# -gt 0 ]; do
         --writes-to-appdata) WRITES_TO_APPDATA=1; shift ;;
         --strip-dead)  STRIP_DEAD=1; shift ;;
         --store)       STORE=1; shift ;;
-        --keystore)    KEYSTORE="$2"; shift 2 ;;
-        --alias)       ALIAS="$2"; shift 2 ;;
-        --storepass)   STOREPASS="$2"; shift 2 ;;
+        --key)         KEY_PEM="$2"; shift 2 ;;
+        --cert)        CERT_PEM="$2"; shift 2 ;;
         --no-verify)   VERIFY=0; shift ;;
         -h|--help)     sed -n '2,/^set -euo/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         -*)            echo "unknown option: $1" >&2; exit 1 ;;
@@ -71,7 +68,7 @@ done
 [ -n "$APK" ] || APK="$REPO/apk/n200_signed.apk"
 [ -f "$APK" ] || { echo "error: original APK not found: $APK" >&2; exit 1; }
 
-for t in unzip zip jarsigner keytool python3; do
+for t in unzip openssl python3; do
     command -v "$t" >/dev/null || { echo "error: missing tool: $t" >&2; exit 1; }
 done
 
@@ -155,51 +152,45 @@ rm -f "$OUT"
 python3 "$REPO/tools/rezip.py" "$WORK/apk" "$APK" "$WORK/unsigned.apk"
 
 # -------------------------------------------------------------- sign
-# JAR signing (APK Signature Scheme v1) is what Android 4.4 verifies.
+# v1 (JAR) signing is what Android 4.4 verifies. NOT done with jarsigner: a
+# modern JDK writes a CMS SignerInfo carrying signed attributes (contentType,
+# messageDigest, signingTime, CMSAlgorithmProtection) with
+# sha256WithRSAEncryption as the signature algorithm -- a shape Android 4.4's
+# Harmony ASN.1 verifier has had trouble with, and different from the original
+# APK, which installs. tools/sign_v1.py reproduces the original's format
+# exactly: SHA-256 digests, no signed attributes, rsaEncryption.
 #
-# The digest and signature algorithms must be pinned, NOT left to the JDK.
-# Android's v1 verifier accepts a SHA-256 digest and SHA256withRSA from API 18
-# onwards, and this APK's minSdkVersion is 19, so SHA-256 is the right choice.
-# Left alone, JDK 21 picks SHA-384, which API 19 is not documented to handle and
-# which can make the install fail with INSTALL_PARSE_FAILED_NO_CERTIFICATES.
-# SHA1 is not an option either: recent JDKs refuse to emit it at all.
-if [ ! -f "$KEYSTORE" ]; then
-    echo "==> creating signing key $KEYSTORE"
-    mkdir -p "$(dirname "$KEYSTORE")"
-    if ! ktout=$(keytool -genkeypair -alias "$ALIAS" \
-            -keyalg RSA -keysize 2048 -sigalg SHA256withRSA -validity 10950 \
-            -keystore "$KEYSTORE" -storepass "$STOREPASS" -keypass "$STOREPASS" \
-            -dname "CN=n200 repack, OU=none, O=none, C=KR" 2>&1); then
-        echo "$ktout" >&2
-        echo "error: could not create the signing key" >&2
-        exit 1
+# The certificate is self-signed with SHA1, like the AOSP testkey certificate
+# on the original. Android never validates an APK certificate's own signature;
+# this only removes one more difference from a package known to install.
+if [ ! -f "$KEY_PEM" ] || [ ! -f "$CERT_PEM" ]; then
+    echo "==> creating signing key $KEY_PEM"
+    mkdir -p "$(dirname "$KEY_PEM")"
+    if ! openssl req -x509 -newkey rsa:2048 -nodes -sha1 -days 10950 \
+            -keyout "$KEY_PEM" -out "$CERT_PEM" \
+            -subj "/C=KR/O=n200 repack/CN=n200" >/dev/null 2>&1; then
+        # Some OpenSSL builds refuse SHA1 for new certificates. The cert's own
+        # signature is never checked by Android, so SHA-256 is equally valid.
+        openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 10950 \
+            -keyout "$KEY_PEM" -out "$CERT_PEM" \
+            -subj "/C=KR/O=n200 repack/CN=n200" >/dev/null 2>&1 || {
+            echo "error: could not create the signing key" >&2; exit 1; }
     fi
 fi
 
 echo "==> signing"
-cp "$WORK/unsigned.apk" "$OUT"
-if ! sigout=$(jarsigner -keystore "$KEYSTORE" -storepass "$STOREPASS" \
-        -keypass "$STOREPASS" -digestalg SHA-256 -sigalg SHA256withRSA \
-        "$OUT" "$ALIAS" 2>&1); then
-    echo "$sigout" >&2
-    echo "error: signing failed" >&2
-    exit 1
-fi
-if ! vrfout=$(jarsigner -verify "$OUT" 2>&1) || ! grep -q "jar verified" <<<"$vrfout"; then
-    echo "$vrfout" >&2
-    echo "error: the signature does not verify" >&2
-    exit 1
-fi
-echo "    signature verifies"
+python3 "$REPO/tools/sign_v1.py" --key "$KEY_PEM" --cert "$CERT_PEM" \
+    "$WORK/unsigned.apk" "$OUT"
 
-# Fail loudly rather than hand over an APK API 19 may refuse to parse.
-if unzip -p "$OUT" META-INF/MANIFEST.MF | grep -qE "SHA-(384|512)-Digest"; then
-    echo "error: signed with a digest Android 4.4 may reject. Your jarsigner" >&2
-    echo "       ignored -digestalg SHA-256; sign with an older JDK or apksigner" >&2
-    echo "       (apksigner sign --v1-signing-enabled true --v2-signing-enabled false)" >&2
-    exit 1
+# Independent cross-check with a second verifier, where one is installed.
+if command -v jarsigner >/dev/null; then
+    if ! vrfout=$(jarsigner -verify "$OUT" 2>&1) || ! grep -q "jar verified" <<<"$vrfout"; then
+        echo "$vrfout" >&2
+        echo "error: jarsigner does not accept the signature" >&2
+        exit 1
+    fi
+    echo "    jarsigner agrees the signature verifies"
 fi
-echo "    digest: $(unzip -p "$OUT" META-INF/MANIFEST.MF | grep -m1 -oE 'SHA-?[0-9]*-Digest')"
 
 # -------------------------------------------------------------- structural gate
 # This is a hard gate, unlike the ABI audit below. It catches the class of bug

@@ -88,6 +88,23 @@ def main() -> int:
                 ok("AndroidManifest.xml, classes.dex, resources.arsc present")
             if not any(n.startswith("lib/") and n.endswith(".so") for n in names):
                 bad("no native libraries")
+            # zipalign state. Not required by Android 4.4, so a note rather
+            # than a failure, but the original APK is aligned and a repack
+            # should not differ from it gratuitously.
+            with open(apk, "rb") as fp:
+                misaligned = []
+                stored = [i for i in z.infolist() if i.compress_type == 0]
+                for i in stored:
+                    fp.seek(i.header_offset)
+                    h = fp.read(30)
+                    n, e = struct.unpack_from("<HH", h, 26)
+                    if (i.header_offset + 30 + n + e) % 4:
+                        misaligned.append(i.filename)
+            if misaligned:
+                print(f"  note  {len(misaligned)} of {len(stored)} stored entries "
+                      f"are not 4-byte aligned (not required on 4.4)")
+            else:
+                ok(f"all {len(stored)} stored entries 4-byte aligned, like the original")
             tmp = tempfile.mkdtemp(prefix="n200check.")
             z.extractall(tmp)
     except zipfile.BadZipFile as exc:
@@ -154,6 +171,93 @@ def main() -> int:
                     bad(e)
             else:
                 ok(f"all {len(libs)} native libraries are valid 32-bit ARM ELF")
+
+        # ---------------------------------------------- v1, self-contained
+        # Re-derive what Android's JarVerifier checks, without depending on a
+        # JDK: every entry's digest in MANIFEST.MF, the .SF digest over the
+        # whole manifest, and a PKCS#7 block that verifies over the .SF bytes.
+        # Also the block's *shape*, because that is what differed between the
+        # original APK (installs) and the jarsigner output (did not): signed
+        # attributes and CMSAlgorithmProtection.
+        import base64
+        meta = root / "META-INF"
+        mf_path = meta / "MANIFEST.MF"
+        sfs = sorted(meta.glob("*.SF")) if meta.is_dir() else []
+        blocks = sorted(p for p in meta.glob("*")
+                        if p.suffix.upper() in (".RSA", ".DSA", ".EC")) if meta.is_dir() else []
+        if not mf_path.is_file() or not sfs or not blocks:
+            bad("v1 signature incomplete (need MANIFEST.MF, a .SF and a signature block)")
+        else:
+            mf_raw = mf_path.read_bytes()
+            # unfold continuation lines to read name -> digest
+            text = mf_raw.decode("utf-8").replace("\r\n ", "")
+            digests = {}
+            name = None
+            for ln in text.split("\r\n"):
+                if ln.startswith("Name: "):
+                    name = ln[6:]
+                elif ln.startswith("SHA-256-Digest: ") and name:
+                    digests[name] = ln[len("SHA-256-Digest: "):]
+                elif not ln:
+                    name = None
+            mismatch = []
+            missing = []
+            for f in sorted(root.rglob("*")):
+                if not f.is_file():
+                    continue
+                rel = str(f.relative_to(root)).replace("\\", "/")
+                if rel.startswith("META-INF/"):
+                    continue
+                want = digests.get(rel)
+                if want is None:
+                    missing.append(rel)
+                    continue
+                got = base64.b64encode(hashlib.sha256(f.read_bytes()).digest()).decode()
+                if got != want:
+                    mismatch.append(rel)
+            if missing:
+                bad(f"{len(missing)} entries absent from MANIFEST.MF, e.g. {missing[:3]}")
+            if mismatch:
+                bad(f"{len(mismatch)} entries whose content does not match "
+                    f"MANIFEST.MF, e.g. {mismatch[:3]}")
+            if not missing and not mismatch:
+                ok(f"MANIFEST.MF digests match all {len(digests)} entries")
+
+            sf_raw = sfs[0].read_bytes()
+            m = re.search(rb"SHA-256-Digest-Manifest: ([A-Za-z0-9+/=]+)", sf_raw)
+            want_mf = m.group(1).decode() if m else None
+            got_mf = base64.b64encode(hashlib.sha256(mf_raw).digest()).decode()
+            if want_mf == got_mf:
+                ok(f"{sfs[0].name} digest of MANIFEST.MF matches")
+            else:
+                bad(f"{sfs[0].name} does not match MANIFEST.MF")
+
+            openssl = shutil.which("openssl")
+            if openssl:
+                v = subprocess.run(
+                    [openssl, "cms", "-verify", "-binary", "-noverify",
+                     "-inform", "DER", "-in", str(blocks[0]),
+                     "-content", str(sfs[0]), "-out", "/dev/null"],
+                    capture_output=True, text=True)
+                if v.returncode == 0:
+                    ok(f"{blocks[0].name} verifies over {sfs[0].name}")
+                else:
+                    bad(f"{blocks[0].name} does not verify over {sfs[0].name}")
+                parsed = subprocess.run(
+                    [openssl, "asn1parse", "-inform", "DER", "-in", str(blocks[0])],
+                    capture_output=True, text=True).stdout
+                attrs = [a for a in ("contentType", "messageDigest", "signingTime",
+                                     "1.2.840.113549.1.9.52")
+                         if re.search(r":%s\s*$" % re.escape(a), parsed, re.MULTILINE)]
+                if attrs:
+                    bad(f"{blocks[0].name} carries signed attributes {attrs}; "
+                        f"the original APK's block has none. Sign with "
+                        f"tools/sign_v1.py, not jarsigner")
+                else:
+                    ok(f"{blocks[0].name} has no signed attributes, matching "
+                       f"the original's format")
+            else:
+                print("  skip  PKCS#7 checks (no openssl)")
 
         # ------------------------------------------------- signature
         jarsigner = shutil.which("jarsigner")
