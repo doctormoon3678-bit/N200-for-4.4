@@ -687,6 +687,28 @@ static void log_line(const char *a, const char *b, const char *c)
  * this project started from. Naming both the path asked for and the path it
  * was mapped to turns a force-close into one line.
  */
+/*
+ * Record the app's successful opens, up to a limit.
+ *
+ * This answers the question the failure log cannot: how far did it get? An
+ * empty list means the process died before touching a single file, which puts
+ * the fault in LocalServiceActivities.<clinit> -- 25 System.loadLibrary calls
+ * before anything is drawn -- and not in this library's business at all. A
+ * list that stops partway names the last thing that worked.
+ *
+ * Bounded, because once the engine is running it opens map tiles continuously
+ * and the point here is startup.
+ */
+static void log_ok(const char *what, const char *orig)
+{
+    static int count;
+    if (count >= 120) return;
+    count++;
+    log_line("opened ", what, orig);
+    if (count == 120)
+        log_line("(startup trace ends here; it got at least this far)", "", "");
+}
+
 static void log_fail(const char *what, const char *orig, const char *mapped)
 {
     static int count;
@@ -788,7 +810,10 @@ void *fopen(const char *path, const char *mode)
     f = r_fopen(m, mode);
     /* The caller will not check this, so say so here while both paths are
      * still in hand. */
-    if (!f && ours) log_fail(w ? "fopen(write)" : "fopen(read)", path, m);
+    if (ours) {
+        if (f) log_ok(w ? "w " : "r ", path);
+        else   log_fail(w ? "fopen(write)" : "fopen(read)", path, m);
+    }
     return f;
 }
 
@@ -809,7 +834,10 @@ int open(const char *path, int flags, ...)
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
     fd = r_open(m, flags, mode);
-    if (fd < 0 && ours) log_fail(w ? "open(write)" : "open(read)", path, m);
+    if (ours) {
+        if (fd >= 0) log_ok(w ? "w " : "r ", path);
+        else         log_fail(w ? "open(write)" : "open(read)", path, m);
+    }
     return fd;
 }
 

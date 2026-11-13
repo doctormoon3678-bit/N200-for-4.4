@@ -7,8 +7,8 @@ if the device needs it, removing its dependency on platform-internal ABI.
 **Map data on the external SD card, writes on internal storage:**
 
 ```sh
-shim/build.sh
-tools/repack.sh --sdcard --keep-dmb      # -> out/n200-note4.apk
+shim/build.sh && stub/build.sh           # clang; no NDK needed
+tools/repack.sh --sdcard --strip-dead    # -> out/n200-note4.apk
 ```
 
 Put the `Navkingdom` tree anywhere on the card; the app finds it at startup.
@@ -147,10 +147,41 @@ of `libstagefright_dmb.so`'s 1458 exports, all on two classes:
 | `android::DMBPlayerClass` | terrestrial DMB TV tuner/player | `libdmb_cont.so`, `libNV_GUI.so` |
 | `android::TTSPlayerClass` | PCM playback sink for voice guidance | `libHNcommonlib.so`, `libGUI_WIDGET.so` |
 
+### The adapter nobody mentioned: libtextlayoutshim.so
+
+`libstagefright_dmb.so` is not the only private-ABI consumer, and the other one
+explains why this APK is stranger than it looks.
+
+`libtextlayoutshim.so` is not part of the app. Someone built it to adapt the
+head unit's `libstagefright_dmb.so` to a **newer** Android than it was compiled
+for. It exports the 4.4-era platform signatures and implements them with the
+5.x ones:
+
+| exports (what `libstagefright_dmb.so` wants) | imports (what it calls) |
+|---|---|
+| `AudioTrack::AudioTrack(..., transfer_type, const audio_offload_info_t*, int)` | the same plus `int, const audio_attributes_t*` |
+| `AudioTrack::write(const void*, size_t)` | `write(const void*, size_t, bool)` |
+| `AudioTrack::getPosition(uint32_t*) const` | `getPosition(uint32_t*)`, non-const |
+| `MediaCodec::CreateByType(..., bool)` | `CreateByType(..., bool, int*)` |
+
+So this APK had already been adapted once, for Android 5.x. Those four imports
+are private platform ABI in their 5.x spelling, reached at load #10, and they
+are a `dlopen` failure on a platform that is not the one it was built against.
+
+Every export it exists for is imported by `libstagefright_dmb.so` and by
+nothing else, so once that is stubbed the adapter is dead weight — but it
+cannot just be deleted, because `libNV_CNS2K.so` lists it in `DT_NEEDED` and
+imports exactly one symbol from it: `forc`. Eighteen bytes of Thumb-2 that
+return `-1`, reproduced exactly in `stub/jni/stub_textlayoutshim.c` rather than
+guessed at.
+
+Replacing it is what finally removes the private ABI, and with it the last
+reason to load `libskik.so`.
+
 ### Swapping it out, when you need to
 
-Replace `libstagefright_dmb.so` with a 16-symbol stub. That single swap drops the
-entire private surface: `libskik.so`, `libstlport.so`, `libft2.so`, `libicuuc.so`,
+Replace `libstagefright_dmb.so` with a 16-symbol stub, and `libtextlayoutshim.so`
+with a 2-symbol one. Together they drop the entire private surface: `libskik.so`, `libstlport.so`, `libft2.so`, `libicuuc.so`,
 `libicui18n.so`, `libexpat.so`, `libpng.so`, `libjpeg.so`, `libcutils.so`,
 `libutils.so`, `libbinder.so`, `libmedia.so`, `libgui.so`, `libui.so`,
 `libstagefright.so`, `libstagefright_foundation.so`, `libandroid_runtime.so` and
@@ -566,11 +597,17 @@ Still not verified:
 * **Whether repointing the root is sufficient on its own.** `fopen` will keep
   returning NULL — and the app will keep crashing in the same place — unless the
   `Navkingdom` data tree actually exists under the new root and is writable.
-* **No repack has been done with the CI-built ARM stub.** The repack pipeline
-  was exercised end to end with the original library in place (`--keep-dmb`),
-  and the ABI end state was measured by substituting a host build, but the two
-  halves have not been put together in one run. Doing that is the first thing
-  `tools/repack.sh --strip-dead` will tell you.
+* ~~No repack has been done with the stub.~~ Done, and it found two things.
+  `--strip-dead` deleted `libskik.so` on the stated grounds that only
+  `libstagefright_dmb.so` needed it — `libtextlayoutshim.so` needs it too, so
+  the result could not have loaded `libNV_CNS2K.so`. And the structural gate
+  rejected the stub swap outright, because it was written for the path-patch
+  flow where no entry may change size; it now takes the list of entries the
+  repack replaced on purpose and stays strict about every other one.
+  `tools/repack.sh --sdcard --strip-dead` now ends with
+  `RESULT: PASS -- nothing outside the NDK-stable ABI remains`, no RISK line
+  anywhere in the 25-library load sequence, and 4.4 MB smaller than the
+  original.
 * Whether the navigation engine tolerates a silent TTS sink. See the tracing
   build above.
 

@@ -6,9 +6,15 @@
 #                                  # navigation engine makes into DMB/TTS
 #   STUB_START_FAILS=1 ./build.sh  # start()/setDataSource() return -1
 #
-# Needs an Android NDK. Point ANDROID_NDK_HOME (or ANDROID_NDK_ROOT) at it, or
-# have ndk-build on PATH. Any NDK that still supports android-19 works; r21e is
-# a good last one. r27+ has dropped API 19 and will not work.
+# Builds with an Android NDK when one is available: point ANDROID_NDK_HOME (or
+# ANDROID_NDK_ROOT) at it, or have ndk-build on PATH. Any NDK that still
+# supports android-19 works; r21e is a good last one, r27+ has dropped API 19.
+#
+# With no NDK it falls back to plain clang, the same way shim/build.sh builds
+# the redirector. That works because this stub is deliberately bare -- no STL,
+# no exceptions, no RTTI, empty bodies, and not one platform header -- so there
+# is nothing an NDK sysroot would have to provide. The gates below are the same
+# either way, and they are what decides whether the result is usable.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -25,19 +31,20 @@ for cand in \
 do
     [ -n "$cand" ] && [ -x "$cand" ] && { NDK_BUILD="$cand"; break; }
 done
-if [ -z "$NDK_BUILD" ]; then
-    echo "error: ndk-build not found." >&2
-    echo "       set ANDROID_NDK_HOME=/path/to/android-ndk-r21e (or put ndk-build on PATH)" >&2
+
+CXX="${CXX:-clang++}"
+if [ -z "$NDK_BUILD" ] && ! command -v "$CXX" >/dev/null; then
+    echo "error: neither ndk-build nor $CXX found." >&2
+    echo "       set ANDROID_NDK_HOME=/path/to/android-ndk-r21e, put ndk-build" >&2
+    echo "       on PATH, or install a clang that can target ARM." >&2
     exit 1
 fi
-NDK_DIR="$(cd "$(dirname "$NDK_BUILD")" && pwd)"
-echo "==> NDK: $NDK_DIR"
 
 # ---------------------------------------------------------------- readelf
 # Prefer the NDK's own llvm-readelf so the host does not need binutils.
 READELF=""
 for cand in \
-    "$NDK_DIR"/toolchains/llvm/prebuilt/*/bin/llvm-readelf \
+    ${NDK_BUILD:+"$(dirname "$NDK_BUILD")"/toolchains/llvm/prebuilt/*/bin/llvm-readelf} \
     "$(command -v readelf 2>/dev/null || true)" \
     "$(command -v llvm-readelf 2>/dev/null || true)"
 do
@@ -47,15 +54,65 @@ done
 
 # ---------------------------------------------------------------- build
 rm -rf "$HERE/libs" "$HERE/obj" "$OUT"
-"$NDK_BUILD" -C "$HERE" \
-    NDK_PROJECT_PATH="$HERE" \
-    APP_BUILD_SCRIPT="$HERE/jni/Android.mk" \
-    NDK_APPLICATION_MK="$HERE/jni/Application.mk" \
-    STUB_TRACE="${STUB_TRACE:-0}" \
-    STUB_START_FAILS="${STUB_START_FAILS:-0}"
 
-SO="$(find "$HERE/libs" -name libstagefright_dmb.so | head -1)"
+if [ -n "$NDK_BUILD" ]; then
+    NDK_DIR="$(cd "$(dirname "$NDK_BUILD")" && pwd)"
+    echo "==> NDK: $NDK_DIR"
+    "$NDK_BUILD" -C "$HERE" \
+        NDK_PROJECT_PATH="$HERE" \
+        APP_BUILD_SCRIPT="$HERE/jni/Android.mk" \
+        NDK_APPLICATION_MK="$HERE/jni/Application.mk" \
+        STUB_TRACE="${STUB_TRACE:-0}" \
+        STUB_START_FAILS="${STUB_START_FAILS:-0}"
+    SO="$(find "$HERE/libs" -name libstagefright_dmb.so | head -1)"
+else
+    echo "==> no NDK; building with $CXX"
+    TARGET=armv7-none-linux-androideabi
+    mkdir -p "$HERE/libs/armeabi-v7a"
+    SO="$HERE/libs/armeabi-v7a/libstagefright_dmb.so"
+    TMPD="$(mktemp -d -t n200stub.XXXXXX)"
+    trap 'rm -rf "$TMPD"' EXIT
+
+    # liblog only, and only for the tracing build. The silent stub calls
+    # nothing at all, so it needs no stub libraries to link against.
+    printf 'void __android_log_print(void){}\n' > "$TMPD/log.c"
+    "$CXX" --target="$TARGET" -fPIC -nostdlib -shared -fuse-ld=lld -w \
+           -x c "$TMPD/log.c" -Wl,-soname,liblog.so -o "$TMPD/liblog.so"
+
+    "$CXX" --target="$TARGET" -fPIC -Os \
+           -ffreestanding -fno-builtin -fno-exceptions -fno-rtti \
+           -fno-stack-protector -Wall -Wextra \
+           -DSTUB_TRACE="${STUB_TRACE:-0}" \
+           -DSTUB_START_FAILS="${STUB_START_FAILS:-0}" \
+           -c "$HERE/jni/stub_players.cpp" -o "$TMPD/stub.o"
+
+    "$CXX" --target="$TARGET" -shared -nostdlib -fuse-ld=lld \
+           -Wl,-soname,libstagefright_dmb.so \
+           -Wl,--version-script="$HERE/jni/stub.map" \
+           "$TMPD/stub.o" "$TMPD/liblog.so" -o "$SO"
+fi
+
 [ -n "$SO" ] || { echo "error: build produced no libstagefright_dmb.so" >&2; exit 1; }
+
+# ------------------------------------------------- the textlayoutshim stub
+# Built with clang either way: it is two functions returning constants, and
+# ndk-build is not worth wiring up for that. Only meaningful alongside the
+# libstagefright_dmb stub -- see the header comment in its source.
+TLS_SO=""
+if command -v "${CC:-clang}" >/dev/null; then
+    TLSD="$(mktemp -d -t n200tls.XXXXXX)"
+    TLS_SO="$HERE/libs/libtextlayoutshim.so"
+    mkdir -p "$HERE/libs"
+    "${CC:-clang}" --target=armv7-none-linux-androideabi -fPIC -Os \
+        -ffreestanding -fno-builtin -fno-stack-protector -Wall -Wextra \
+        -c "$HERE/jni/stub_textlayoutshim.c" -o "$TLSD/tls.o"
+    printf '{ global: forc; noop_vtable_fn; local: *; };\n' > "$TLSD/tls.map"
+    "${CC:-clang}" --target=armv7-none-linux-androideabi -shared -nostdlib \
+        -fuse-ld=lld -Wl,-soname,libtextlayoutshim.so \
+        -Wl,--version-script="$TLSD/tls.map" -Wl,--no-undefined \
+        "$TLSD/tls.o" -o "$TLS_SO"
+    rm -rf "$TLSD"
+fi
 
 # ---------------------------------------------------------------- verify
 echo
@@ -121,6 +178,24 @@ echo "    ok: only NDK-stable dependencies"
 rm -f "$HERE/.got.txt"
 mkdir -p "$OUT"
 cp "$SO" "$OUT/libstagefright_dmb.so"
+if [ -n "$TLS_SO" ] && [ -f "$TLS_SO" ]; then
+    cp "$TLS_SO" "$OUT/libtextlayoutshim.so"
+    tls_exp=$("$READELF" -sW --dyn-syms "$TLS_SO" \
+        | awk '$7!="UND" && ($5=="GLOBAL"||$5=="WEAK"){sub(/@.*/,"",$8); print $8}' \
+        | sort -u | tr '\n' ' ')
+    tls_dep=$("$READELF" -d "$TLS_SO" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' | tr '\n' ' ')
+    if [ "$(echo $tls_exp)" != "forc noop_vtable_fn" ]; then
+        echo "FAIL: libtextlayoutshim stub exports [$tls_exp], expected forc + noop_vtable_fn" >&2
+        exit 1
+    fi
+    if [ -n "$tls_dep" ]; then
+        echo "FAIL: libtextlayoutshim stub should need nothing, needs [$tls_dep]" >&2
+        exit 1
+    fi
+    echo "    ok: libtextlayoutshim stub exports forc + noop_vtable_fn, needs nothing"
+    echo "==> $OUT/libtextlayoutshim.so  ($(stat -c%s "$TLS_SO") bytes)"
+    echo "    original was 21613 bytes"
+fi
 
 echo
 echo "==> $OUT/libstagefright_dmb.so  ($(stat -c%s "$OUT/libstagefright_dmb.so") bytes)"

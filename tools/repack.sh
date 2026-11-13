@@ -102,6 +102,11 @@ if [ "$SDCARD" -eq 1 ]; then
     fi
 fi
 
+# Entries this run replaces or deletes on purpose. The structural gate is
+# told about them so that it can stay strict about every other entry: an
+# unexplained size change there means an in-place byte patch moved offsets.
+REPLACED=()
+
 WORK="$(mktemp -d -t n200repack.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -115,15 +120,41 @@ LIBDIR="$WORK/apk/lib/armeabi"
 if [ "$KEEP_DMB" -eq 0 ]; then
     OLDSZ=$(stat -c%s "$LIBDIR/libstagefright_dmb.so" 2>/dev/null || echo 0)
     cp "$STUB" "$LIBDIR/libstagefright_dmb.so"
+    REPLACED+=(lib/armeabi/libstagefright_dmb.so)
     NEWSZ=$(stat -c%s "$LIBDIR/libstagefright_dmb.so")
     echo "==> libstagefright_dmb.so: $OLDSZ -> $NEWSZ bytes (stub)"
+
+    # libtextlayoutshim.so adapts the head unit's libstagefright_dmb.so to a
+    # newer platform's AudioTrack/MediaCodec. With that library stubbed, every
+    # export it exists for is unused -- but it is still a DT_NEEDED of
+    # libNV_CNS2K.so, so it keeps being loaded and keeps importing four
+    # private 5.x platform symbols, which is a dlopen failure on anything
+    # else. Replacing it drops that, and with it the last reason to load
+    # libskik.so. See stub/jni/stub_textlayoutshim.c.
+    TLSSTUB="$(dirname "$STUB")/libtextlayoutshim.so"
+    if [ -f "$TLSSTUB" ] && [ -f "$LIBDIR/libtextlayoutshim.so" ]; then
+        TOLD=$(stat -c%s "$LIBDIR/libtextlayoutshim.so")
+        cp "$TLSSTUB" "$LIBDIR/libtextlayoutshim.so"
+        REPLACED+=(lib/armeabi/libtextlayoutshim.so)
+        echo "==> libtextlayoutshim.so: $TOLD -> $(stat -c%s "$LIBDIR/libtextlayoutshim.so") bytes (stub)"
+    elif [ -f "$LIBDIR/libtextlayoutshim.so" ]; then
+        echo "    note: no libtextlayoutshim stub beside $STUB; keeping the"
+        echo "          original, which still needs private platform ABI"
+    fi
 else
     echo "==> keeping the original libstagefright_dmb.so (--keep-dmb)"
 fi
 
 # -------------------------------------------------------------- dead weight
-# Once the stub is in, nothing references these:
-#   libskik.so        <- was needed only by libstagefright_dmb.so
+# Once both stubs are in, nothing references these. Checked against every
+# DT_NEEDED in the APK and against the 25 System.loadLibrary names in
+# classes.dex -- none of them is loaded by name:
+#   libskik.so        <- was needed by libstagefright_dmb.so AND by
+#                        libtextlayoutshim.so, which is why deleting it while
+#                        keeping the original adapter produced an APK that
+#                        could not load libNV_CNS2K.so
+#   libicuuk.so       <- needed only by libskik.so and libicui18x.so
+#   libicui18x.so     <- needed only by libskik.so and libicuuk.so
 #   libcorkscrew.so   <- was needed only by libstagefright_dmb.so
 #   libgccdemangle.so <- was needed only by libcorkscrew.so
 #   gdbserver         <- debug build leftover
@@ -133,10 +164,12 @@ if [ "$STRIP_DEAD" -eq 1 ]; then
         exit 1
     fi
     FREED=0
-    for dead in libskik.so libcorkscrew.so libgccdemangle.so gdbserver; do
+    for dead in libskik.so libicuuk.so libicui18x.so libcorkscrew.so \
+                libgccdemangle.so gdbserver; do
         if [ -f "$LIBDIR/$dead" ]; then
             FREED=$((FREED + $(stat -c%s "$LIBDIR/$dead")))
             rm -f "$LIBDIR/$dead"
+            REPLACED+=("lib/armeabi/$dead")
             echo "    removed lib/armeabi/$dead"
         fi
     done
@@ -248,7 +281,10 @@ fi
 # that produces a silent "install failed" -- notably a dex whose string length
 # prefixes no longer match its content, which still checksums and signs cleanly.
 echo
-if ! python3 "$REPO/tools/check_apk.py" "$OUT" --original "$APK"; then
+REPL_ARGS=()
+for r in ${REPLACED+"${REPLACED[@]}"}; do REPL_ARGS+=(--replaced "$r"); done
+if ! python3 "$REPO/tools/check_apk.py" "$OUT" --original "$APK" \
+        ${REPL_ARGS+"${REPL_ARGS[@]}"}; then
     echo
     echo "error: the repacked APK is structurally broken; refusing to ship it." >&2
     mv -f "$OUT" "$OUT.rejected"

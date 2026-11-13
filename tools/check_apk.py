@@ -54,6 +54,10 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("apk")
     ap.add_argument("--original", help="compare entry sizes against this APK")
+    ap.add_argument("--replaced", action="append", metavar="NAME",
+                    help="entry this repack replaced or removed on purpose, so "
+                         "a size change there is expected rather than the sign "
+                         "of an in-place patch gone wrong; repeatable")
     args = ap.parse_args()
 
     apk = pathlib.Path(args.apk)
@@ -291,7 +295,13 @@ def main() -> int:
             else:
                 with zipfile.ZipFile(orig) as z:
                     osizes = {i.filename: i.file_size for i in z.infolist()}
-                grew = []
+                # Entries this repack replaced outright, rather than patched in
+                # place. A swapped-in stub is a different file and is supposed
+                # to be a different size; the point of this check is to catch a
+                # byte patch that moved offsets, so those are reported
+                # separately instead of failing.
+                replaced = set(args.replaced or [])
+                grew, swapped = [], []
                 for name in names:
                     if name.startswith("META-INF/"):
                         continue
@@ -299,12 +309,23 @@ def main() -> int:
                         with zipfile.ZipFile(apk) as z2:
                             n = z2.getinfo(name).file_size
                         if n != osizes[name]:
-                            grew.append(f"{name}: {osizes[name]} -> {n}")
+                            (swapped if name in replaced else grew).append(
+                                f"{name}: {osizes[name]} -> {n}")
+                for s in swapped:
+                    ok(f"replaced on purpose, not patched: {s}")
+                gone = sorted(n for n in osizes
+                              if n not in names and not n.startswith("META-INF/"))
+                for g in gone:
+                    if g in replaced:
+                        ok(f"removed on purpose: {g}")
+                    else:
+                        bad(f"entry disappeared from the APK: {g}")
                 if grew:
                     for g in grew:
                         bad(f"size changed, so an in-place patch moved offsets: {g}")
                 else:
-                    ok("no entry changed size relative to the original")
+                    ok(f"no in-place patch changed any entry's size "
+                       f"({len(names) - len(swapped)} entries)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
