@@ -223,11 +223,11 @@ static int   (*r_close)(int);
 static int   (*r_fcntl)(int, int, long);
 static int   (*r_usleep)(u32);
 static unsigned long (*r_pthread_self)(void);
+static int   (*r_pthread_mutex_lock)(void *);
 
 /* Defined in the map-initialize tracer section, used by the libc wrappers
  * above it. */
 static int  sql_here(void);
-static int  sql_same_thread(void);
 static void sql_log(const char *what, long a, long b);
 static void sql_log_open(const char *path);
 
@@ -713,7 +713,7 @@ static void resolve(void)
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
     GET(read); GET(write); GET(close); GET(fcntl);
-    GET(usleep); GET(pthread_self);
+    GET(usleep); GET(pthread_self); GET(pthread_mutex_lock);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -1069,22 +1069,9 @@ void *fopen(const char *path, const char *mode)
     return f;
 }
 
-/*
- * The map-list SQLite database must not live on FUSE.
- *
- * It is opened read-write, and a device trace stops dead the instant that open
- * returns -- no read, no write, the thread simply never comes back -- because
- * the writable root is internal storage, which on Android 4.4 is a FUSE volume
- * (the sdcard daemon). The app's own data directory is real ext4 and never
- * stalls, so while the map-list open runs, its database and journal go there
- * instead. The directory is created on demand and the engine rebuilds this
- * cache every start, so starting from an empty copy is fine.
- */
-#define N200FS_PRIV "/data/data/com.npnd.n200/files/n200dt"
-
 int open(const char *path, int flags, ...)
 {
-    char buf[PATHMAX], priv[PATHMAX];
+    char buf[PATHMAX];
     const char *m;
     int mode = 0, w, ours, fd;
     resolve();
@@ -1105,16 +1092,6 @@ int open(const char *path, int flags, ...)
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
-    /* Keep the map-list database and its journal off FUSE. */
-    if (sql_same_thread() && w) {
-        const char *rest;
-        if (strip_root(path, &rest) &&
-            join_rest(priv, sizeof priv, N200FS_PRIV, rest)) {
-            make_parents(priv);
-            m = priv;
-            log_line("sql    db put on app-private ext4: ", priv, "");
-        }
-    }
     fd = r_open(m, flags, mode);
     if (ours) {
         if (fd >= 0) log_ok(w ? "w " : "r ", path);
@@ -1241,6 +1218,17 @@ int usleep(u32 usec)
     if (!r_usleep) resolve();
     if (sql_here()) sql_log("usleep", (long)usec, 0);
     return r_usleep ? r_usleep(usec) : -1;
+}
+
+/* Traced like read/write: the map-list open blocked with no syscall at all,
+ * which points at a lock. If the next barrier is a mutex this logs it just
+ * before the wait, so a deadlock shows as a final "mutex_lock" line naming the
+ * mutex address. Pass-through otherwise. */
+int pthread_mutex_lock(void *mutex)
+{
+    if (!r_pthread_mutex_lock) resolve();
+    if (sql_here()) sql_log("mutex_lock", (long)mutex, 0);
+    return r_pthread_mutex_lock ? r_pthread_mutex_lock(mutex) : 0;
 }
 
 int stat(const char *path, void *st)
@@ -2159,26 +2147,16 @@ static int            g_sql_lines;
  * blocking call. */
 static int sql_here(void)
 {
-    if (!g_sqlopen || g_sql_lines >= 200) return 0;
+    if (!g_sqlopen || g_sql_lines >= 400) return 0;
     if (r_pthread_self && g_sql_tid) return r_pthread_self() == g_sql_tid;
     return 1;
-}
-
-/* Stricter than sql_here: true only when the running thread is positively the
- * one inside the map-list open. Used to decide path redirection, where the
- * log-only fallback of sql_here must not apply -- a background loader thread's
- * writes must never be moved. */
-static int sql_same_thread(void)
-{
-    return g_sqlopen && r_pthread_self && g_sql_tid
-        && r_pthread_self() == g_sql_tid;
 }
 
 static void sql_log(const char *what, long a, long b)
 {
     char buf[80];
     int k = 0;
-    if (g_sql_lines >= 200) return;
+    if (g_sql_lines >= 400) return;
     g_sql_lines++;
     s_cat(buf, sizeof buf, &k, what);
     s_cat(buf, sizeof buf, &k, " fd=");
@@ -2191,7 +2169,7 @@ static void sql_log(const char *what, long a, long b)
 
 static void sql_log_open(const char *path)
 {
-    if (g_sql_lines >= 200) return;
+    if (g_sql_lines >= 400) return;
     g_sql_lines++;
     log_line("sql    open ", path ? path : "(null)", "");
 }
@@ -2319,6 +2297,12 @@ long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
     if (c) *c = 0;
     log_line("sql    zh_maplist_db_open stubbed (sqlite deadlock avoided); "
              "returning success with no map-list DB", "", "");
+    /* The stub unblocks map_initialize, but the NV_MD main thread then stalls
+     * again further on (process_init line 1507 -> the font manager). Keep
+     * tracing this thread's syscalls and mutex waits from here so the next
+     * barrier is named in the log. This runs on the NV_MD main thread. */
+    g_sql_tid = r_pthread_self ? r_pthread_self() : 0;
+    g_sqlopen = 1;
     mi_exit("zh_maplist_db_open", k, 1);
     return 1;
 }

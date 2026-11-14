@@ -61,7 +61,7 @@ cat > "$WORK/export.map" <<'EOF'
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
     utimes; statfs; system; strcasecmp; fcntl; fsync; fdatasync;
-    read; write; usleep;
+    read; write; usleep; pthread_mutex_lock;
     n200fs_note;
     __android_log_print;
     _Z22NaviGetNaviSDCardStatev;
@@ -150,6 +150,7 @@ mkdir
 n200fs_note
 open
 opendir
+pthread_mutex_lock
 read
 remove
 rename
@@ -166,7 +167,7 @@ got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports the 19 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters, the nvMsg_Receive loop probe, the 5 map_initialize tracers and n200fs_note"
+    say ok "exports the 20 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters, the nvMsg_Receive loop probe, the 5 map_initialize tracers and n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true
