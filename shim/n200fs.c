@@ -1914,6 +1914,63 @@ int _Z28NaviGetUnloadNaviProcessFlagv(void)
     return 0;
 }
 
+/* --- NV_MD main-loop liveness probe ---
+ *
+ * The map renderer draws from its own thread, CMVMainThread::ThreadProc in
+ * libNV_MD.so. That thread only produces frames once it reaches its message
+ * loop, which runs
+ *     nvMsg_Receive(6, pulse_reciever, msg_reciever, 20)
+ * every 20 ms and, on each timeout, calls on_driving() -> the draw pipeline.
+ * Before that loop the thread passes two wait stages (it blocks until the
+ * drawing thread is up, then until a second readiness byte flips). On a car
+ * that second byte is set by a sibling process; on a phone there is no sibling,
+ * so if it never flips the thread waits forever, on_driving() never runs, and
+ * the map layer stays blank behind an HMI that is otherwise ready -- exactly
+ * the symptom a device log showed (all three HMI gates satisfied, no map).
+ *
+ * nvMsg_Receive is imported by libNV_MD.so and defined in libHNcommonlib.so,
+ * so interposing it here reports, per channel, whether that loop is alive.
+ * Channel 6 appearing means the renderer reached its loop; its absence means
+ * the thread is still stuck in a pre-loop wait. Logging is throttled hard --
+ * the first call on each channel, then one line per 1000 -- so the log shows
+ * liveness without flooding.
+ */
+int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
+        int ch, void *pulse, void *msg, int timeout);
+
+int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
+        int ch, void *pulse, void *msg, int timeout)
+{
+    static int (*real)(int, void *, void *, int);
+    static int tried;
+    static unsigned seen[16];
+    if (!tried) {
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        tried = 1;
+        if (h) real = (int (*)(int, void *, void *, int))dlsym(h,
+            "_Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi");
+        if ((void *)real ==
+            (void *)_Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi)
+            real = 0;
+    }
+    if (ch >= 0 && ch < 16) {
+        unsigned c = seen[ch]++;
+        if (c == 0 || (c % 1000u) == 0) {
+            char b[64];
+            int n = 0;
+            s_cat(b, sizeof b, &n, " channel ");
+            put_u(b, &n, sizeof b, (unsigned)ch, 0);
+            s_cat(b, sizeof b, &n, " timeout ");
+            put_u(b, &n, sizeof b, (unsigned)timeout, 0);
+            s_cat(b, sizeof b, &n, " call ");
+            put_u(b, &n, sizeof b, c, 0);
+            log_line("nvrecv ", b, "");
+            LOGI("nvMsg_Receive ch=%d timeout=%d call=%u", ch, timeout, c);
+        }
+    }
+    return real ? real(ch, pulse, msg, timeout) : 0;
+}
+
 /* ====================================================================== *
  *  Capturing the engine's own trace
  *

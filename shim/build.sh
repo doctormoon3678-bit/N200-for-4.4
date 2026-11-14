@@ -71,6 +71,7 @@ cat > "$WORK/export.map" <<'EOF'
     _Z27md_get_displayDriveShowModev;
     _Z27md_get_first_layer_on_statev;
     _Z27md_set_first_layer_on_statei;
+    _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi;
     _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z;
@@ -116,7 +117,8 @@ fi
 # 3. exports are exactly the interposed set -- an extra export would be bound
 #    by the app's libraries in place of libc's, which is how you break a
 #    program you meant to fix.
-want="_Z17NaviChkFirstMountv
+want="_Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi
+_Z17NaviChkFirstMountv
 _Z21NaviGetMapInitialDonev
 _Z22NaviGetNaviSDCardStatev
 _Z22mdGetFirstLayerOnStatev
@@ -147,7 +149,7 @@ got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters and n200fs_note"
+    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters, the nvMsg_Receive loop probe and n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true
