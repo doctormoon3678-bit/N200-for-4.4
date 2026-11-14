@@ -2239,9 +2239,26 @@ static void sql_log_caller(void *ra)
         s_cat(line, sizeof line, &k, "+");
         put_u(line, &k, sizeof line, (unsigned)((unsigned long)ra - saddr), 0);
     } else {
-        s_cat(line, sizeof line, &k, " +fileoff ");
-        put_u(line, &k, sizeof line,
-              (unsigned)((unsigned long)ra - (unsigned long)info[1]), 0);
+        /* Stripped static function: dladdr gives no symbol, and its fbase for
+         * this case is unreliable. Recover libHNcommonlib's load base from a
+         * known export (sqlite3_open, file offset 0x454a1c) and report the true
+         * file offset so the function can be found in the binary. */
+        static unsigned long hnbase;
+        static int hntried;
+        if (!hntried) {
+            void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+            hntried = 1;
+            if (h) {
+                void *p = dlsym(h, "sqlite3_open");
+                if (p) hnbase = (unsigned long)p - 0x454a1cUL;
+            }
+        }
+        s_cat(line, sizeof line, &k, " +off ");
+        if (hnbase)
+            put_u(line, &k, sizeof line, (unsigned)((unsigned long)ra - hnbase), 0);
+        else
+            put_u(line, &k, sizeof line,
+                  (unsigned)((unsigned long)ra - (unsigned long)info[1]), 0);
     }
     log_line("sql    ", line, "");
 }
