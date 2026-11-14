@@ -228,7 +228,6 @@ static int   (*r_pthread_mutex_lock)(void *);
 /* Defined in the map-initialize tracer section, used by the libc wrappers
  * above it. */
 static int  sql_here(void);
-static int  on_sql_thread(void);
 static void sql_log(const char *what, long a, long b);
 static void sql_log_open(const char *path);
 
@@ -1225,33 +1224,33 @@ int usleep(u32 usec)
  * which points at a lock. If the next barrier is a mutex this logs it just
  * before the wait, so a deadlock shows as a final "mutex_lock" line naming the
  * mutex address. Pass-through otherwise. */
+/* Turn a return address into a libNV_MD.so file offset, so the spin loop's
+ * location can be read straight off the log. The load base is recovered once
+ * from a known exported symbol (process_init, file offset 0x1aa468). */
+static long caller_off(void *ra)
+{
+    static unsigned long base;
+    static int tried;
+    if (!tried) {
+        void *h = dlopen("libNV_MD.so", RTLD_NOW);
+        tried = 1;
+        if (h) {
+            void *p = dlsym(h, "_Z12process_initv");
+            if (p) base = (unsigned long)p - 0x1aa468UL;
+        }
+    }
+    if (!base) return -1;
+    return (long)((unsigned long)ra - base);
+}
+
 int pthread_mutex_lock(void *mutex)
 {
     if (!r_pthread_mutex_lock) resolve();
-    if (on_sql_thread()) {
-        /* Experiment: the stalled renderer libraries (libNV_MD/POS/RP) all
-         * import gBootWaiting, a boot-wait flag that lives in libHNcommonlib.
-         * After the DB stub the main thread spins in a poll loop (it locks and
-         * unlocks mutexes forever with no I/O), which is what a "wait until boot
-         * done" loop looks like when the signal never arrives in single-process
-         * mode. The spin locks the mutexes this wrapper sees, so clear the flag
-         * from here each time; if that loop is the one watching it, it ends. */
-        static volatile int *boot;
-        static int tried, noted;
-        if (!tried) {
-            void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
-            tried = 1;
-            if (h) boot = (volatile int *)dlsym(h, "gBootWaiting");
-        }
-        if (boot) {
-            if (!noted) {
-                noted = 1;
-                log_line("boot   forcing gBootWaiting = 0 (boot-done) on map thread",
-                         "", "");
-            }
-            *boot = 0;
-        }
-        if (sql_here()) sql_log("mutex_lock", (long)mutex, 0);
+    if (sql_here()) {
+        /* Log where the lock is taken from, as a libNV_MD offset, so the poll
+         * loop that never ends is named by its repeating caller offset. */
+        sql_log("mlock caller_off", caller_off(__builtin_return_address(0)),
+                (long)mutex);
     }
     return r_pthread_mutex_lock ? r_pthread_mutex_lock(mutex) : 0;
 }
@@ -2175,15 +2174,6 @@ static int sql_here(void)
     if (!g_sqlopen || g_sql_lines >= 400) return 0;
     if (r_pthread_self && g_sql_tid) return r_pthread_self() == g_sql_tid;
     return 1;
-}
-
-/* True on the NV_MD main thread once the stub armed the trace, with no line
- * cap -- used to drive the gBootWaiting experiment on every mutex lock the
- * spin makes, not only the first 400 that get logged. */
-static int on_sql_thread(void)
-{
-    return g_sqlopen && r_pthread_self && g_sql_tid
-        && r_pthread_self() == g_sql_tid;
 }
 
 static void sql_log(const char *what, long a, long b)
