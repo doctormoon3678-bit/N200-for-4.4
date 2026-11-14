@@ -1683,6 +1683,100 @@ int _Z21NaviGetMapInitialDonev(void)
     return gate_forced(&g, gate_real(&g, _Z21NaviGetMapInitialDonev), 30);
 }
 
+/* --- underlying first-layer-on gate (libHNcommonlib.so) ---
+ *
+ * mdGetFirstLayerOnState in libGUI_WIDGET.so is a thin PLT wrapper around
+ * md_get_first_layer_on_state (defined in libHNcommonlib.so). The HMI calls
+ * mdGetFirstLayerOnState via a DIRECT call within libGUI_WIDGET.so, bypassing
+ * our DT_NEEDED interposition above. But the wrapper itself reaches the
+ * underlying function through PLT, so intercepting HERE catches every path.
+ *
+ * On a real car the map renderer sends draw pulses that eventually call
+ * md_set_first_layer_on_state(1). On a phone those pulses never arrive, so
+ * this function stays 0 forever and the "준비중" splash never clears.
+ * After 15 seconds we force it to 1 and also call NaviSetMapInitialDone(true)
+ * to release the second gate that the HMI polls.
+ */
+static int g_fl_forced;
+
+int _Z27md_get_first_layer_on_statev(void)
+{
+    int v;
+    static int (*real)(void);
+    static int tried, last;
+    static long since;
+    long t;
+
+    if (g_fl_forced) return 1;
+
+    if (!tried) {
+        void *h;
+        tried = 1;
+        last = -2;
+        h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) real = (int (*)(void))dlsym(h,
+                       "_Z27md_get_first_layer_on_statev");
+        if (real == _Z27md_get_first_layer_on_statev) real = 0;
+    }
+
+    v = real ? (real() & 0xff) : -1;
+    if (v != last) {
+        last = v;
+        LOGI("gate md_get_first_layer_on_state = %d", v);
+        log_line("gate   ", "md_get_first_layer_on_state",
+                 v < 0 ? " = (not found)" : v == 0 ? " = 0" : " = 1");
+    }
+    if (v == 1) { g_fl_forced = 1; return 1; }
+
+    t = now_s();
+    if (!since) since = t;
+    if (t - since < 15) return v < 0 ? 0 : v;
+
+    g_fl_forced = 1;
+    log_line("gate   ", "md_get_first_layer_on_state",
+             " stuck at 0 for 15 s -- forcing 1");
+    LOGI("gate md_get_first_layer_on_state stuck -- forcing 1");
+
+    /* Also release NaviGetMapInitialDone by calling the real setter inside
+     * libGUI_WIDGET.so. That writes the global byte that the getter reads
+     * directly, so even intra-library callers will see 1. */
+    {
+        static void (*setMapInit)(int);
+        if (!setMapInit) {
+            void *h2 = dlopen("libGUI_WIDGET.so", RTLD_NOW);
+            if (h2) setMapInit = (void (*)(int))dlsym(h2,
+                                  "_Z21NaviSetMapInitialDoneb");
+        }
+        if (setMapInit) {
+            setMapInit(1);
+            log_line("gate   ", "NaviSetMapInitialDone",
+                     " forced to 1 via real setter");
+        }
+    }
+    return 1;
+}
+
+void _Z27md_set_first_layer_on_statei(int v)
+{
+    static void (*real)(int);
+    static int tried;
+    if (!tried) {
+        void *h;
+        tried = 1;
+        h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) real = (void (*)(int))dlsym(h,
+                       "_Z27md_set_first_layer_on_statei");
+        if ((void *)real == (void *)_Z27md_set_first_layer_on_statei)
+            real = 0;
+    }
+    if (v) {
+        g_fl_forced = 1;
+        LOGI("md_set_first_layer_on_state(%d)", v);
+        log_line("gate   ", "md_set_first_layer_on_state", " = 1");
+    }
+    if (real) real(v);
+}
+
 /* Watched only: these are passed straight through. */
 int _Z17NaviChkFirstMountv(void)
 {
