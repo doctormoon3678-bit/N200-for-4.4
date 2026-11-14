@@ -2284,26 +2284,43 @@ long _Z16zh_basefile_initPvPii(void *a, void *b, long c)
     return r;
 }
 
+/*
+ * zh_maplist_db_open: stubbed, because the real call never returns.
+ *
+ * It opens the map-list database read-write and deadlocks inside sqlite before
+ * the first byte of I/O. The trace proved it is not the filesystem: the open
+ * succeeds and the thread then stops dead with no read, write, usleep or fsync,
+ * identically whether the database sits on the FUSE internal volume or on real
+ * ext4 in the app's data directory. It is a lock or mmap deadlock in sqlite's
+ * unix layer under this single-process port, with the map renderer's own thread
+ * holding whatever it waits on -- and because this blocks map_initialize(), the
+ * render thread never reaches its message loop (nvMsg_Receive channel 6) and the
+ * map never draws.
+ *
+ * map_initialize() only needs a non-zero return to carry on, and its continue
+ * path never touches the two handles this call fills in (it clears a global to
+ * null and moves on to zh_vertexfile_init). So report success with empty
+ * handles. The engine already tolerates a missing database -- the admin-name
+ * database came back null earlier and startup kept going -- so the base map,
+ * whose tiles load over a separate path, still renders; only lookups that would
+ * have gone through the map-list database are skipped. This trades a feature
+ * that never worked here for a map that does.
+ */
 long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
-        void *a, void *b, void *c);
+        void *a, void **b, void **c);
 long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
-        void *a, void *b, void *c)
+        void *a, void **b, void **c)
 {
-    static void *real;
     static unsigned n;
     unsigned k = n++;
-    long r;
-    mi_resolve("_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo",
-               &real,
-               (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
+    (void)a;
     mi_enter("zh_maplist_db_open", k);
-    /* Watch this thread's syscalls: this is the call that never returns. */
-    g_sql_tid = r_pthread_self ? r_pthread_self() : 0;
-    g_sqlopen = 1;
-    r = real ? ((long (*)(void *, void *, void *))real)(a, b, c) : -1;
-    g_sqlopen = 0;
-    mi_exit("zh_maplist_db_open", k, r);
-    return r;
+    if (b) *b = 0;
+    if (c) *c = 0;
+    log_line("sql    zh_maplist_db_open stubbed (sqlite deadlock avoided); "
+             "returning success with no map-list DB", "", "");
+    mi_exit("zh_maplist_db_open", k, 1);
+    return 1;
 }
 
 long _Z18zh_vertexfile_initPvPii(void *a, void *b, long c);
