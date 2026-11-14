@@ -60,8 +60,7 @@ cat > "$WORK/export.map" <<'EOF'
   global:
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
-    utimes; statfs; system; strcasecmp; fcntl; fsync; fdatasync;
-    read; write; usleep; pthread_mutex_lock;
+    utimes; statfs; system; strcasecmp;
     n200fs_note;
     __android_log_print;
     _Z22NaviGetNaviSDCardStatev;
@@ -73,11 +72,6 @@ cat > "$WORK/export.map" <<'EOF'
     _Z27md_get_first_layer_on_statev;
     _Z27md_set_first_layer_on_statei;
     _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi;
-    _Z6z_OpenPcP16SNavisFileHandle;
-    _Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader;
-    _Z16zh_basefile_initPvPii;
-    _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo;
-    _Z18zh_vertexfile_initPvPii;
     _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z;
     _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z;
@@ -124,11 +118,7 @@ fi
 #    by the app's libraries in place of libc's, which is how you break a
 #    program you meant to fix.
 want="_Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi
-_Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader
-_Z16zh_basefile_initPvPii
 _Z17NaviChkFirstMountv
-_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo
-_Z18zh_vertexfile_initPvPii
 _Z21NaviGetMapInitialDonev
 _Z22NaviGetNaviSDCardStatev
 _Z22mdGetFirstLayerOnStatev
@@ -136,22 +126,16 @@ _Z27md_get_displayDriveShowModev
 _Z27md_get_first_layer_on_statev
 _Z27md_set_first_layer_on_statei
 _Z28NaviGetUnloadNaviProcessFlagv
-_Z6z_OpenPcP16SNavisFileHandle
 _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
 __android_log_print
 access
-fcntl
-fdatasync
 fopen
-fsync
 mkdir
 n200fs_note
 open
 opendir
-pthread_mutex_lock
-read
 remove
 rename
 rmdir
@@ -160,14 +144,12 @@ statfs
 strcasecmp
 system
 unlink
-usleep
-utimes
-write"
+utimes"
 got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports the 20 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters, the nvMsg_Receive loop probe, the 5 map_initialize tracers and n200fs_note"
+    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters, the nvMsg_Receive loop probe and n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true

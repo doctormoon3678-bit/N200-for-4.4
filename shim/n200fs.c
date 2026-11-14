@@ -220,17 +220,6 @@ static int   (*r_system)(const char *);
 static int   (*r_read)(int, void *, u32);
 static int   (*r_write)(int, const void *, u32);
 static int   (*r_close)(int);
-static int   (*r_fcntl)(int, int, long);
-static int   (*r_usleep)(u32);
-static unsigned long (*r_pthread_self)(void);
-static int   (*r_pthread_mutex_lock)(void *);
-
-/* Defined in the map-initialize tracer section, used by the libc wrappers
- * above it. */
-static int  sql_here(void);
-static void sql_log(const char *what, long a, long b);
-static void sql_log_open(const char *path);
-static void sql_log_caller(void *ra);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
@@ -713,8 +702,7 @@ static void resolve(void)
     GET(fopen); GET(open); GET(stat); GET(access); GET(opendir);
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
-    GET(read); GET(write); GET(close); GET(fcntl);
-    GET(usleep); GET(pthread_self); GET(pthread_mutex_lock);
+    GET(read); GET(write); GET(close);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -1089,7 +1077,6 @@ int open(const char *path, int flags, ...)
         int pfd = gps_open_pipe(path);
         if (pfd >= 0) return pfd;
     }
-    if (sql_here()) sql_log_open(path);
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
@@ -1099,162 +1086,6 @@ int open(const char *path, int flags, ...)
         else         log_fail(w ? "open(write)" : "open(read)", path, m);
     }
     return fd;
-}
-
-/*
- * fcntl(2): neutralise POSIX advisory file locking.
- *
- * zh_maplist_db_open -> CNavisSQLAccess::Open opens a SQLite database on the
- * SD card. That card is a FUSE overlay on Android 4.4, and its fcntl byte-range
- * locks do not behave the way SQLite's unix VFS expects: the very first lock
- * request inside sqlite3 blocks and never returns, so map_initialize() -- and
- * with it the whole NV_MD render thread -- stops dead before it draws a single
- * frame. A device trace pinned the stall to exactly this call (an "mi->
- * zh_maplist_db_open" with no matching return), and the renderer's message loop
- * (nvMsg_Receive channel 6) never starts as a result.
- *
- * A navigation app is the only process touching its own databases, so advisory
- * locks buy nothing: answering every lock request with "granted" lets SQLite
- * proceed exactly as on a normal filesystem, which is what the stock "nolock"
- * VFS does. Thread safety inside the process is SQLite's own mutexes, not these
- * locks, so nothing is weakened. Every other fcntl command passes straight
- * through.
- */
-int fcntl(int fd, int cmd, ...)
-{
-    long arg;
-    __builtin_va_list ap;
-    resolve();
-    __builtin_va_start(ap, cmd);
-    arg = __builtin_va_arg(ap, long);
-    __builtin_va_end(ap);
-
-    switch (cmd) {
-    case 5:   /* F_GETLK    */
-    case 12:  /* F_GETLK64  */
-        /* "no conflicting lock": set l_type (first field of struct flock) to
-         * F_UNLCK so the caller believes the range is free. */
-        if (arg) *(short *)(void *)arg = 2 /* F_UNLCK */;
-        /* fall through */
-    case 6:   /* F_SETLK    */
-    case 7:   /* F_SETLKW   */
-    case 13:  /* F_SETLK64  */
-    case 14:  /* F_SETLKW64 */
-    {
-        static int n;
-        if (n < 20) {
-            n++;
-            log_line("fcntl  file lock request granted without blocking", "", "");
-        }
-        return 0;
-    }
-    default:
-        return r_fcntl ? r_fcntl(fd, cmd, arg) : -1;
-    }
-}
-
-/*
- * fsync(2) / fdatasync(2): do not force a flush, just succeed.
- *
- * With file locking neutralised the map-list SQLite open got further but still
- * never returned: its next barrier is the flush it does after writing the
- * database it is building. The database is redirected onto internal storage,
- * which on Android 4.4 is itself a FUSE volume (sdcard daemon over ext4), and
- * an fsync through that layer can stall for many seconds or indefinitely while
- * a map-sized database is committed page by page -- long enough that the whole
- * NV_MD render thread never reaches its loop.
- *
- * The data is still written; only the explicit "flush to platter now" is
- * dropped, so the kernel writes it back on its own schedule. For databases and
- * caches the engine rebuilds every start that is a safe trade, and it is what
- * SQLite itself does under "PRAGMA synchronous = OFF". Reported, throttled, so
- * the log shows the flushes that would otherwise have blocked.
- */
-static int fsync_noop(const char *which)
-{
-    static int n;
-    if (n < 30) {
-        n++;
-        log_line("fsync  ", which, " skipped (would block on FUSE)");
-    }
-    return 0;
-}
-
-int fsync(int fd)
-{
-    (void)fd;
-    return fsync_noop("fsync");
-}
-
-int fdatasync(int fd)
-{
-    (void)fd;
-    return fsync_noop("fdatasync");
-}
-
-/*
- * read/write/usleep: pass-through, but while the map-list SQLite open is on the
- * main thread, log each one this thread makes just before it runs. The call
- * that blocks is then the last "sql" line in the log -- a blocking read or
- * write names the file descriptor, a run of usleep lines means a busy retry
- * loop. Logging is thread-filtered and capped, and off entirely once the open
- * returns, so steady-state I/O is untouched.
- */
-int read(int fd, void *buf, u32 n)
-{
-    if (!r_read) resolve();
-    if (sql_here()) sql_log("read ", fd, (long)n);
-    return r_read ? r_read(fd, buf, n) : -1;
-}
-
-int write(int fd, const void *buf, u32 n)
-{
-    if (!r_write) resolve();
-    if (sql_here()) sql_log("write", fd, (long)n);
-    return r_write ? r_write(fd, buf, n) : -1;
-}
-
-int usleep(u32 usec)
-{
-    if (!r_usleep) resolve();
-    if (sql_here()) sql_log("usleep", (long)usec, 0);
-    return r_usleep ? r_usleep(usec) : -1;
-}
-
-/* Traced like read/write: the map-list open blocked with no syscall at all,
- * which points at a lock. If the next barrier is a mutex this logs it just
- * before the wait, so a deadlock shows as a final "mutex_lock" line naming the
- * mutex address. Pass-through otherwise. */
-/* Turn a return address into a libNV_MD.so file offset, so the spin loop's
- * location can be read straight off the log. The load base is recovered once
- * from a known exported symbol (process_init, file offset 0x1aa468). */
-static long caller_off(void *ra)
-{
-    static unsigned long base;
-    static int tried;
-    if (!tried) {
-        void *h = dlopen("libNV_MD.so", RTLD_NOW);
-        tried = 1;
-        if (h) {
-            void *p = dlsym(h, "_Z12process_initv");
-            if (p) base = (unsigned long)p - 0x1aa468UL;
-        }
-    }
-    if (!base) return -1;
-    return (long)((unsigned long)ra - base);
-}
-
-int pthread_mutex_lock(void *mutex)
-{
-    if (!r_pthread_mutex_lock) resolve();
-    if (sql_here()) {
-        /* The spin's caller offset landed outside libNV_MD, so the loop is in
-         * another library. Resolve the return address to its library and nearest
-         * symbol so the poll loop is named outright. */
-        (void)caller_off;
-        sql_log_caller(__builtin_return_address(0));
-    }
-    return r_pthread_mutex_lock ? r_pthread_mutex_lock(mutex) : 0;
 }
 
 int stat(const char *path, void *st)
@@ -1468,6 +1299,7 @@ static void n200fs_init(void)
  *  keeps that honest.
  * ====================================================================== */
 
+static int  (*r_usleep)(u32);
 static long (*r_time)(void *);
 static int  (*r_pthread_create)(void *, const void *, void *(*)(void *), void *);
 
@@ -1625,6 +1457,7 @@ static void send_burst(int fd)
  * gps=off is for.
  */
 static int (*r_pipe)(int *);
+static int (*r_fcntl)(int, int, long);
 static int g_gps_wfd = -1;
 
 static int is_gps_fifo(const char *p)
@@ -1676,12 +1509,9 @@ static void gps_start(void)
     static unsigned long tid;
     static int started;
     if (!g_gps || started) return;
+    r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
     r_pipe = (void *)dlsym(RTLD_DEFAULT, "pipe");
-    /* r_fcntl and r_usleep are resolved in resolve() from the libc handle;
-     * both are now interposed by this library, so RTLD_DEFAULT here would bind
-     * to our own wrappers and recurse. Make sure they are resolved in case GPS
-     * starts first. */
-    resolve();
+    r_fcntl = (void *)dlsym(RTLD_DEFAULT, "fcntl");
     r_fdopen = (void *)dlsym(RTLD_DEFAULT, "fdopen");
     r_time = (void *)dlsym(RTLD_DEFAULT, "time");
     r_pthread_create = (void *)dlsym(RTLD_DEFAULT, "pthread_create");
@@ -2139,276 +1969,6 @@ int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
         }
     }
     return real ? real(ch, pulse, msg, timeout) : 0;
-}
-
-/* --- map_initialize sub-call tracer ------------------------------------
- *
- * The nvMsg_Receive probe showed channel 6 never runs: the NV_MD main thread
- * never reaches its render loop. Its last step is process_init() line 1398,
- * right before map_initialize(), which never returns (line 1403 never prints)
- * even though every map file loads. So the stall is inside one of
- * map_initialize's calls. These Navis entry points are all defined in
- * libHNcommonlib.so and all called from map_initialize; tracing them on entry
- * and exit makes the blocking one show up in n200fs.log as an "mi->" with no
- * matching "mi<-". Forwarding uses pointer-width args only (AAPCS r0-r3), so no
- * struct layout is assumed, and the whole trace is capped so a healthy run does
- * not flood the log. dlsym on the libHNcommonlib handle returns that library's
- * own definition (its own symbols are searched before its dependencies), so the
- * forward reaches the real function, never back into this interposer.
- */
-static int g_mi_lines;
-
-/* While the map-list SQLite open runs on the main thread, every read/write/
- * usleep that thread makes is logged, so the single call it blocks on is the
- * last "sql" line in n200fs.log. Keyed on the thread id captured at entry so
- * the background map loaders' own I/O is not mixed in. */
-static volatile int   g_sqlopen;
-static unsigned long  g_sql_tid;
-static int            g_sql_lines;
-
-/* True while the map-list open runs on the thread that started it. gettid is a
- * static inline on Android 4.4 and cannot be dlsym'd, so the thread is keyed on
- * pthread_self, which libc always exports. If even that does not resolve, log
- * unfiltered (capped) rather than going silent -- a noisy trace still names the
- * blocking call. */
-static int sql_here(void)
-{
-    if (!g_sqlopen || g_sql_lines >= 400) return 0;
-    if (r_pthread_self && g_sql_tid) return r_pthread_self() == g_sql_tid;
-    return 1;
-}
-
-static void sql_log(const char *what, long a, long b)
-{
-    char buf[80];
-    int k = 0;
-    if (g_sql_lines >= 400) return;
-    g_sql_lines++;
-    s_cat(buf, sizeof buf, &k, what);
-    s_cat(buf, sizeof buf, &k, " fd=");
-    if (a < 0) { s_cat(buf, sizeof buf, &k, "-"); put_u(buf, &k, sizeof buf, (unsigned)-a, 0); }
-    else put_u(buf, &k, sizeof buf, (unsigned)a, 0);
-    s_cat(buf, sizeof buf, &k, " n=");
-    put_u(buf, &k, sizeof buf, (unsigned)b, 0);
-    log_line("sql    ", buf, "");
-}
-
-static void sql_log_open(const char *path)
-{
-    if (g_sql_lines >= 400) return;
-    g_sql_lines++;
-    log_line("sql    open ", path ? path : "(null)", "");
-}
-
-/* Resolve a return address to "library symbol+delta" via dladdr and log it, so
- * the spin loop's exact function is named. dladdr's strings point into the
- * loaded libraries' own tables and are safe to read directly. */
-static void sql_log_caller(void *ra)
-{
-    static int (*dladdr_fn)(const void *, void *);
-    static int tried;
-    void *info[4];              /* Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr */
-    char line[192];
-    int k = 0, i;
-    const char *fname, *sname, *base;
-    unsigned long saddr;
-
-    if (g_sql_lines >= 400) return;
-    if (!tried) {
-        tried = 1;
-        dladdr_fn = (int (*)(const void *, void *))dlsym(RTLD_DEFAULT, "dladdr");
-    }
-    g_sql_lines++;
-    if (!dladdr_fn || !dladdr_fn(ra, info)) {
-        log_line("sql    mlock caller (dladdr failed)", "", "");
-        return;
-    }
-    fname = (const char *)info[0];
-    sname = (const char *)info[2];
-    saddr = (unsigned long)info[3];
-
-    base = fname ? fname : "?";
-    for (i = 0; fname && fname[i]; i++)
-        if (fname[i] == '/') base = fname + i + 1;
-
-    s_cat(line, sizeof line, &k, "mlock in ");
-    s_cat(line, sizeof line, &k, base);
-    if (sname && sname[0]) {
-        s_cat(line, sizeof line, &k, " ");
-        s_cat(line, sizeof line, &k, sname);
-        s_cat(line, sizeof line, &k, "+");
-        put_u(line, &k, sizeof line, (unsigned)((unsigned long)ra - saddr), 0);
-    } else {
-        /* Stripped static function: dladdr gives no symbol, and its fbase for
-         * this case is unreliable. Recover libHNcommonlib's load base from a
-         * known export (sqlite3_open, file offset 0x454a1c) and report the true
-         * file offset so the function can be found in the binary. */
-        static unsigned long hnbase;
-        static int hntried;
-        if (!hntried) {
-            void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
-            hntried = 1;
-            if (h) {
-                void *p = dlsym(h, "sqlite3_open");
-                if (p) hnbase = (unsigned long)p - 0x454a1cUL;
-            }
-        }
-        s_cat(line, sizeof line, &k, " +off ");
-        if (hnbase)
-            put_u(line, &k, sizeof line, (unsigned)((unsigned long)ra - hnbase), 0);
-        else
-            put_u(line, &k, sizeof line,
-                  (unsigned)((unsigned long)ra - (unsigned long)info[1]), 0);
-    }
-    log_line("sql    ", line, "");
-}
-
-static void mi_resolve(const char *mangled, void **slot, void *self)
-{
-    if (!*slot) {
-        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
-        if (h) *slot = dlsym(h, mangled);
-        if (*slot == self) *slot = 0;
-    }
-}
-
-static void mi_enter(const char *name, unsigned n)
-{
-    char b[48];
-    int k = 0;
-    if (g_mi_lines >= 800) return;
-    g_mi_lines++;
-    s_cat(b, sizeof b, &k, name);
-    s_cat(b, sizeof b, &k, " #");
-    put_u(b, &k, sizeof b, n, 0);
-    log_line("mi->   ", b, "");
-}
-
-static void mi_exit(const char *name, unsigned n, long ret)
-{
-    char b[64];
-    int k = 0;
-    if (g_mi_lines >= 800) return;
-    g_mi_lines++;
-    s_cat(b, sizeof b, &k, name);
-    s_cat(b, sizeof b, &k, " #");
-    put_u(b, &k, sizeof b, n, 0);
-    s_cat(b, sizeof b, &k, " = ");
-    if (ret < 0) {
-        s_cat(b, sizeof b, &k, "-");
-        put_u(b, &k, sizeof b, (unsigned)(-ret), 0);
-    } else {
-        put_u(b, &k, sizeof b, (unsigned)ret, 0);
-    }
-    log_line("mi<-   ", b, "");
-}
-
-long _Z6z_OpenPcP16SNavisFileHandle(void *a, void *b);
-long _Z6z_OpenPcP16SNavisFileHandle(void *a, void *b)
-{
-    static void *real;
-    static unsigned n;
-    unsigned c = n++;
-    long r;
-    mi_resolve("_Z6z_OpenPcP16SNavisFileHandle", &real,
-               (void *)_Z6z_OpenPcP16SNavisFileHandle);
-    mi_enter("z_Open", c);
-    r = real ? ((long (*)(void *, void *))real)(a, b) : -1;
-    mi_exit("z_Open", c, r);
-    return r;
-}
-
-long _Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader(
-        void *a, void *b);
-long _Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader(
-        void *a, void *b)
-{
-    static void *real;
-    static unsigned n;
-    unsigned c = n++;
-    long r;
-    mi_resolve("_Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader",
-               &real,
-               (void *)_Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader);
-    mi_enter("zPSyncInfoLoad", c);
-    r = real ? ((long (*)(void *, void *))real)(a, b) : -1;
-    mi_exit("zPSyncInfoLoad", c, r);
-    return r;
-}
-
-long _Z16zh_basefile_initPvPii(void *a, void *b, long c);
-long _Z16zh_basefile_initPvPii(void *a, void *b, long c)
-{
-    static void *real;
-    static unsigned n;
-    unsigned k = n++;
-    long r;
-    mi_resolve("_Z16zh_basefile_initPvPii", &real,
-               (void *)_Z16zh_basefile_initPvPii);
-    mi_enter("zh_basefile_init", k);
-    r = real ? ((long (*)(void *, void *, long))real)(a, b, c) : -1;
-    mi_exit("zh_basefile_init", k, r);
-    return r;
-}
-
-/*
- * zh_maplist_db_open: stubbed, because the real call never returns.
- *
- * It opens the map-list database read-write and deadlocks inside sqlite before
- * the first byte of I/O. The trace proved it is not the filesystem: the open
- * succeeds and the thread then stops dead with no read, write, usleep or fsync,
- * identically whether the database sits on the FUSE internal volume or on real
- * ext4 in the app's data directory. It is a lock or mmap deadlock in sqlite's
- * unix layer under this single-process port, with the map renderer's own thread
- * holding whatever it waits on -- and because this blocks map_initialize(), the
- * render thread never reaches its message loop (nvMsg_Receive channel 6) and the
- * map never draws.
- *
- * map_initialize() only needs a non-zero return to carry on, and its continue
- * path never touches the two handles this call fills in (it clears a global to
- * null and moves on to zh_vertexfile_init). So report success with empty
- * handles. The engine already tolerates a missing database -- the admin-name
- * database came back null earlier and startup kept going -- so the base map,
- * whose tiles load over a separate path, still renders; only lookups that would
- * have gone through the map-list database are skipped. This trades a feature
- * that never worked here for a map that does.
- */
-long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
-        void *a, void **b, void **c);
-long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
-        void *a, void **b, void **c)
-{
-    static unsigned n;
-    unsigned k = n++;
-    (void)a;
-    mi_enter("zh_maplist_db_open", k);
-    if (b) *b = 0;
-    if (c) *c = 0;
-    log_line("sql    zh_maplist_db_open stubbed (sqlite deadlock avoided); "
-             "returning success with no map-list DB", "", "");
-    /* The stub unblocks map_initialize, but the NV_MD main thread then stalls
-     * again further on (process_init line 1507 -> the font manager). Keep
-     * tracing this thread's syscalls and mutex waits from here so the next
-     * barrier is named in the log. This runs on the NV_MD main thread. */
-    g_sql_tid = r_pthread_self ? r_pthread_self() : 0;
-    g_sqlopen = 1;
-    mi_exit("zh_maplist_db_open", k, 1);
-    return 1;
-}
-
-long _Z18zh_vertexfile_initPvPii(void *a, void *b, long c);
-long _Z18zh_vertexfile_initPvPii(void *a, void *b, long c)
-{
-    static void *real;
-    static unsigned n;
-    unsigned k = n++;
-    long r;
-    mi_resolve("_Z18zh_vertexfile_initPvPii", &real,
-               (void *)_Z18zh_vertexfile_initPvPii);
-    mi_enter("zh_vertexfile_init", k);
-    r = real ? ((long (*)(void *, void *, long))real)(a, b, c) : -1;
-    mi_exit("zh_vertexfile_init", k, r);
-    return r;
 }
 
 /* ====================================================================== *
