@@ -230,6 +230,7 @@ static int   (*r_pthread_mutex_lock)(void *);
 static int  sql_here(void);
 static void sql_log(const char *what, long a, long b);
 static void sql_log_open(const char *path);
+static void sql_log_caller(void *ra);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
@@ -1247,10 +1248,11 @@ int pthread_mutex_lock(void *mutex)
 {
     if (!r_pthread_mutex_lock) resolve();
     if (sql_here()) {
-        /* Log where the lock is taken from, as a libNV_MD offset, so the poll
-         * loop that never ends is named by its repeating caller offset. */
-        sql_log("mlock caller_off", caller_off(__builtin_return_address(0)),
-                (long)mutex);
+        /* The spin's caller offset landed outside libNV_MD, so the loop is in
+         * another library. Resolve the return address to its library and nearest
+         * symbol so the poll loop is named outright. */
+        (void)caller_off;
+        sql_log_caller(__builtin_return_address(0));
     }
     return r_pthread_mutex_lock ? r_pthread_mutex_lock(mutex) : 0;
 }
@@ -2196,6 +2198,52 @@ static void sql_log_open(const char *path)
     if (g_sql_lines >= 400) return;
     g_sql_lines++;
     log_line("sql    open ", path ? path : "(null)", "");
+}
+
+/* Resolve a return address to "library symbol+delta" via dladdr and log it, so
+ * the spin loop's exact function is named. dladdr's strings point into the
+ * loaded libraries' own tables and are safe to read directly. */
+static void sql_log_caller(void *ra)
+{
+    static int (*dladdr_fn)(const void *, void *);
+    static int tried;
+    void *info[4];              /* Dl_info: dli_fname, dli_fbase, dli_sname, dli_saddr */
+    char line[192];
+    int k = 0, i;
+    const char *fname, *sname, *base;
+    unsigned long saddr;
+
+    if (g_sql_lines >= 400) return;
+    if (!tried) {
+        tried = 1;
+        dladdr_fn = (int (*)(const void *, void *))dlsym(RTLD_DEFAULT, "dladdr");
+    }
+    g_sql_lines++;
+    if (!dladdr_fn || !dladdr_fn(ra, info)) {
+        log_line("sql    mlock caller (dladdr failed)", "", "");
+        return;
+    }
+    fname = (const char *)info[0];
+    sname = (const char *)info[2];
+    saddr = (unsigned long)info[3];
+
+    base = fname ? fname : "?";
+    for (i = 0; fname && fname[i]; i++)
+        if (fname[i] == '/') base = fname + i + 1;
+
+    s_cat(line, sizeof line, &k, "mlock in ");
+    s_cat(line, sizeof line, &k, base);
+    if (sname && sname[0]) {
+        s_cat(line, sizeof line, &k, " ");
+        s_cat(line, sizeof line, &k, sname);
+        s_cat(line, sizeof line, &k, "+");
+        put_u(line, &k, sizeof line, (unsigned)((unsigned long)ra - saddr), 0);
+    } else {
+        s_cat(line, sizeof line, &k, " +fileoff ");
+        put_u(line, &k, sizeof line,
+              (unsigned)((unsigned long)ra - (unsigned long)info[1]), 0);
+    }
+    log_line("sql    ", line, "");
 }
 
 static void mi_resolve(const char *mangled, void **slot, void *self)
