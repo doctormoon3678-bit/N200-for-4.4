@@ -220,6 +220,7 @@ static int   (*r_system)(const char *);
 static int   (*r_read)(int, void *, u32);
 static int   (*r_write)(int, const void *, u32);
 static int   (*r_close)(int);
+static int   (*r_fcntl)(int, int, long);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
@@ -702,7 +703,7 @@ static void resolve(void)
     GET(fopen); GET(open); GET(stat); GET(access); GET(opendir);
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
-    GET(read); GET(write); GET(close);
+    GET(read); GET(write); GET(close); GET(fcntl);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -1088,6 +1089,58 @@ int open(const char *path, int flags, ...)
     return fd;
 }
 
+/*
+ * fcntl(2): neutralise POSIX advisory file locking.
+ *
+ * zh_maplist_db_open -> CNavisSQLAccess::Open opens a SQLite database on the
+ * SD card. That card is a FUSE overlay on Android 4.4, and its fcntl byte-range
+ * locks do not behave the way SQLite's unix VFS expects: the very first lock
+ * request inside sqlite3 blocks and never returns, so map_initialize() -- and
+ * with it the whole NV_MD render thread -- stops dead before it draws a single
+ * frame. A device trace pinned the stall to exactly this call (an "mi->
+ * zh_maplist_db_open" with no matching return), and the renderer's message loop
+ * (nvMsg_Receive channel 6) never starts as a result.
+ *
+ * A navigation app is the only process touching its own databases, so advisory
+ * locks buy nothing: answering every lock request with "granted" lets SQLite
+ * proceed exactly as on a normal filesystem, which is what the stock "nolock"
+ * VFS does. Thread safety inside the process is SQLite's own mutexes, not these
+ * locks, so nothing is weakened. Every other fcntl command passes straight
+ * through.
+ */
+int fcntl(int fd, int cmd, ...)
+{
+    long arg;
+    __builtin_va_list ap;
+    resolve();
+    __builtin_va_start(ap, cmd);
+    arg = __builtin_va_arg(ap, long);
+    __builtin_va_end(ap);
+
+    switch (cmd) {
+    case 5:   /* F_GETLK    */
+    case 12:  /* F_GETLK64  */
+        /* "no conflicting lock": set l_type (first field of struct flock) to
+         * F_UNLCK so the caller believes the range is free. */
+        if (arg) *(short *)(void *)arg = 2 /* F_UNLCK */;
+        /* fall through */
+    case 6:   /* F_SETLK    */
+    case 7:   /* F_SETLKW   */
+    case 13:  /* F_SETLK64  */
+    case 14:  /* F_SETLKW64 */
+    {
+        static int n;
+        if (n < 20) {
+            n++;
+            log_line("fcntl  file lock request granted without blocking", "", "");
+        }
+        return 0;
+    }
+    default:
+        return r_fcntl ? r_fcntl(fd, cmd, arg) : -1;
+    }
+}
+
 int stat(const char *path, void *st)
 {
     char buf[PATHMAX];
@@ -1457,7 +1510,6 @@ static void send_burst(int fd)
  * gps=off is for.
  */
 static int (*r_pipe)(int *);
-static int (*r_fcntl)(int, int, long);
 static int g_gps_wfd = -1;
 
 static int is_gps_fifo(const char *p)
@@ -1511,7 +1563,10 @@ static void gps_start(void)
     if (!g_gps || started) return;
     r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
     r_pipe = (void *)dlsym(RTLD_DEFAULT, "pipe");
-    r_fcntl = (void *)dlsym(RTLD_DEFAULT, "fcntl");
+    /* r_fcntl is resolved in resolve() from the libc handle; fcntl is now
+     * interposed by this library, so RTLD_DEFAULT here would bind to our own
+     * wrapper and recurse. Make sure it is resolved in case GPS starts first. */
+    resolve();
     r_fdopen = (void *)dlsym(RTLD_DEFAULT, "fdopen");
     r_time = (void *)dlsym(RTLD_DEFAULT, "time");
     r_pthread_create = (void *)dlsym(RTLD_DEFAULT, "pthread_create");
