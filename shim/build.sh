@@ -68,6 +68,7 @@ cat > "$WORK/export.map" <<'EOF'
     _Z21NaviGetMapInitialDonev;
     _Z17NaviChkFirstMountv;
     _Z28NaviGetUnloadNaviProcessFlagv;
+    _Z27md_get_displayDriveShowModev;
     _Z27md_get_first_layer_on_statev;
     _Z27md_set_first_layer_on_statei;
     _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z;
@@ -119,6 +120,7 @@ want="_Z17NaviChkFirstMountv
 _Z21NaviGetMapInitialDonev
 _Z22NaviGetNaviSDCardStatev
 _Z22mdGetFirstLayerOnStatev
+_Z27md_get_displayDriveShowModev
 _Z27md_get_first_layer_on_statev
 _Z27md_set_first_layer_on_statei
 _Z28NaviGetUnloadNaviProcessFlagv
@@ -145,7 +147,7 @@ got=$(readelf --dyn-syms -W "$WORK/libn200fs.so" |
       awk '$4=="FUNC" && $5=="GLOBAL" && $7!="UND" {sub(/@.*/,"",$8); print $8}' |
       sort -u)
 if [ "$want" = "$got" ]; then
-    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the 7 gate getters/setters and n200fs_note"
+    say ok "exports the 13 libc entry points, the 3 engine trace hooks, the 8 gate getters/setters and n200fs_note"
 else
     say FAIL "export set differs"
     diff <(echo "$want") <(echo "$got") | sed 's/^/        /' || true

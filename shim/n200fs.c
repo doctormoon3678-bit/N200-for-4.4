@@ -1683,6 +1683,89 @@ int _Z21NaviGetMapInitialDonev(void)
     return gate_forced(&g, gate_real(&g, _Z21NaviGetMapInitialDonev), 30);
 }
 
+/* --- renderer kick ---
+ *
+ * On the car the HMI drives the renderer through a startup sequence:
+ *   1. setMVDriveShowType(1)  ->  md_set_displayDriveShowMode(1)
+ *   2. setMV_Polling_DriveShowCmd(true)  ->  md_send_cmd(0, 55, 1, 0)
+ * On a phone that chain never fires. Once the gates are forced, call the
+ * same functions to tell the renderer it should start drawing.
+ *
+ * md_get_displayDriveShowMode is imported by libNV_MD.so via PLT and
+ * intercepted here so the renderer sees "1" even if the real global is
+ * still 0.
+ */
+static int g_driveshow_forced;
+
+int _Z27md_get_displayDriveShowModev(void)
+{
+    static int (*real)(void);
+    static int tried, last;
+    if (g_driveshow_forced) return 1;
+    if (!tried) {
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        tried = 1;
+        last = -2;
+        if (h) real = (int (*)(void))dlsym(h,
+                       "_Z27md_get_displayDriveShowModev");
+        if (real == _Z27md_get_displayDriveShowModev) real = 0;
+    }
+    {
+        int v = real ? real() : -1;
+        if (v != last) {
+            last = v;
+            LOGI("gate md_get_displayDriveShowMode = %d", v);
+            log_line("gate   ", "md_get_displayDriveShowMode",
+                     v < 0 ? " = (not found)" : v == 0 ? " = 0" : " = 1");
+        }
+        return v < 0 ? 0 : v;
+    }
+}
+
+static void kick_renderer(void)
+{
+    if (g_driveshow_forced) return;
+    g_driveshow_forced = 1;
+
+    /* 1. md_set_displayDriveShowMode(1) — the real global in libHNcommonlib */
+    {
+        static void (*fn)(int);
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) fn = (void (*)(int))dlsym(h,
+                     "_Z27md_set_displayDriveShowModei");
+        if (fn) {
+            fn(1);
+            log_line("render ", "md_set_displayDriveShowMode", " = 1");
+        }
+    }
+
+    /* 2. md_set_disp_state_DriveShow(true) — a second display-state flag */
+    {
+        static void (*fn)(int);
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) fn = (void (*)(int))dlsym(h,
+                     "_Z27md_set_disp_state_DriveShowb");
+        if (fn) {
+            fn(1);
+            log_line("render ", "md_set_disp_state_DriveShow", " = 1");
+        }
+    }
+
+    /* 3. md_send_cmd(0, 55, 1, 0) — the command that tells the renderer
+     *    to enter drive-show mode, normally sent by setMV_Polling_DriveShowCmd */
+    {
+        static int (*fn)(int, int, int, int);
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) fn = (int (*)(int, int, int, int))dlsym(h,
+                     "_Z11md_send_cmdiiii");
+        if (fn) {
+            fn(0, 55, 1, 0);
+            log_line("render ", "md_send_cmd", "(0, 55, 1, 0)");
+        }
+    }
+    LOGI("kick_renderer: DriveShow mode forced, cmd 55 sent");
+}
+
 /* --- underlying first-layer-on gate (libHNcommonlib.so) ---
  *
  * mdGetFirstLayerOnState in libGUI_WIDGET.so is a thin PLT wrapper around
@@ -1773,6 +1856,8 @@ int _Z27md_get_first_layer_on_statev(void)
                      " forced to 1 via real setter");
         }
     }
+
+    kick_renderer();
     return 1;
 }
 
