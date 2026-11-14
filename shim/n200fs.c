@@ -1698,6 +1698,7 @@ int _Z21NaviGetMapInitialDonev(void)
  * to release the second gate that the HMI polls.
  */
 static int g_fl_forced;
+void _Z27md_set_first_layer_on_statei(int);
 
 int _Z27md_get_first_layer_on_statev(void)
 {
@@ -1736,6 +1737,25 @@ int _Z27md_get_first_layer_on_statev(void)
     log_line("gate   ", "md_get_first_layer_on_state",
              " stuck at 0 for 15 s -- forcing 1");
     LOGI("gate md_get_first_layer_on_state stuck -- forcing 1");
+
+    /* Call the REAL setter in libHNcommonlib.so so the actual global variable
+     * is set to 1. Every caller -- including the map renderer (libNV_MD.so),
+     * which also imports this symbol via PLT -- will see the real value. */
+    {
+        static void (*realSet)(int);
+        if (!realSet) {
+            void *hl = dlopen("libHNcommonlib.so", RTLD_NOW);
+            if (hl) realSet = (void (*)(int))dlsym(hl,
+                                "_Z27md_set_first_layer_on_statei");
+            if ((void *)realSet == (void *)_Z27md_set_first_layer_on_statei)
+                realSet = 0;
+        }
+        if (realSet) {
+            realSet(1);
+            log_line("gate   ", "md_set_first_layer_on_state",
+                     " called real setter(1) in libHNcommonlib");
+        }
+    }
 
     /* Also release NaviGetMapInitialDone by calling the real setter inside
      * libGUI_WIDGET.so. That writes the global byte that the getter reads
@@ -1795,11 +1815,13 @@ int _Z28NaviGetUnloadNaviProcessFlagv(void)
     /* This one is stuck the other way round: 1 means "navigation processes
      * not loaded", and it is cleared by the SD-insert handler that a device
      * log showed never running. The processes themselves are up -- the map
-     * tables are being read -- so after the same wait, answer 0. */
-    if (v != 1 || !g_force) return v < 0 ? 0 : v;
+     * tables are being read -- so after the same wait, answer 0.
+     * No g_force needed: the SD-insert event never fires on a phone, so
+     * this flag is always stuck at 1. */
+    if (v != 1) return v < 0 ? 0 : v;
     t = now_s();
     if (!g.since) g.since = t;
-    if (t - g.since < 30) return 1;
+    if (t - g.since < 15) return 1;
     if (g.since != -1) {
         g.since = -1;
         log_line("gate   ", g.label, " stuck at 1 -- answering 0 from here on");
