@@ -227,6 +227,7 @@ static unsigned long (*r_pthread_self)(void);
 /* Defined in the map-initialize tracer section, used by the libc wrappers
  * above it. */
 static int  sql_here(void);
+static int  sql_same_thread(void);
 static void sql_log(const char *what, long a, long b);
 static void sql_log_open(const char *path);
 
@@ -1068,9 +1069,22 @@ void *fopen(const char *path, const char *mode)
     return f;
 }
 
+/*
+ * The map-list SQLite database must not live on FUSE.
+ *
+ * It is opened read-write, and a device trace stops dead the instant that open
+ * returns -- no read, no write, the thread simply never comes back -- because
+ * the writable root is internal storage, which on Android 4.4 is a FUSE volume
+ * (the sdcard daemon). The app's own data directory is real ext4 and never
+ * stalls, so while the map-list open runs, its database and journal go there
+ * instead. The directory is created on demand and the engine rebuilds this
+ * cache every start, so starting from an empty copy is fine.
+ */
+#define N200FS_PRIV "/data/data/com.npnd.n200/files/n200dt"
+
 int open(const char *path, int flags, ...)
 {
-    char buf[PATHMAX];
+    char buf[PATHMAX], priv[PATHMAX];
     const char *m;
     int mode = 0, w, ours, fd;
     resolve();
@@ -1091,6 +1105,16 @@ int open(const char *path, int flags, ...)
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
+    /* Keep the map-list database and its journal off FUSE. */
+    if (sql_same_thread() && w) {
+        const char *rest;
+        if (strip_root(path, &rest) &&
+            join_rest(priv, sizeof priv, N200FS_PRIV, rest)) {
+            make_parents(priv);
+            m = priv;
+            log_line("sql    db put on app-private ext4: ", priv, "");
+        }
+    }
     fd = r_open(m, flags, mode);
     if (ours) {
         if (fd >= 0) log_ok(w ? "w " : "r ", path);
@@ -2138,6 +2162,16 @@ static int sql_here(void)
     if (!g_sqlopen || g_sql_lines >= 200) return 0;
     if (r_pthread_self && g_sql_tid) return r_pthread_self() == g_sql_tid;
     return 1;
+}
+
+/* Stricter than sql_here: true only when the running thread is positively the
+ * one inside the map-list open. Used to decide path redirection, where the
+ * log-only fallback of sql_here must not apply -- a background loader thread's
+ * writes must never be moved. */
+static int sql_same_thread(void)
+{
+    return g_sqlopen && r_pthread_self && g_sql_tid
+        && r_pthread_self() == g_sql_tid;
 }
 
 static void sql_log(const char *what, long a, long b)
