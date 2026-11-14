@@ -222,12 +222,13 @@ static int   (*r_write)(int, const void *, u32);
 static int   (*r_close)(int);
 static int   (*r_fcntl)(int, int, long);
 static int   (*r_usleep)(u32);
-static int   (*r_gettid)(void);
+static unsigned long (*r_pthread_self)(void);
 
 /* Defined in the map-initialize tracer section, used by the libc wrappers
  * above it. */
 static int  sql_here(void);
 static void sql_log(const char *what, long a, long b);
+static void sql_log_open(const char *path);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
@@ -711,7 +712,7 @@ static void resolve(void)
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
     GET(read); GET(write); GET(close); GET(fcntl);
-    GET(usleep); GET(gettid);
+    GET(usleep); GET(pthread_self);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -1086,6 +1087,7 @@ int open(const char *path, int flags, ...)
         int pfd = gps_open_pipe(path);
         if (pfd >= 0) return pfd;
     }
+    if (sql_here()) sql_log_open(path);
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
@@ -2122,13 +2124,20 @@ static int g_mi_lines;
  * usleep that thread makes is logged, so the single call it blocks on is the
  * last "sql" line in n200fs.log. Keyed on the thread id captured at entry so
  * the background map loaders' own I/O is not mixed in. */
-static volatile int  g_sqlopen;
-static int           g_sql_tid;
-static int           g_sql_lines;
+static volatile int   g_sqlopen;
+static unsigned long  g_sql_tid;
+static int            g_sql_lines;
 
+/* True while the map-list open runs on the thread that started it. gettid is a
+ * static inline on Android 4.4 and cannot be dlsym'd, so the thread is keyed on
+ * pthread_self, which libc always exports. If even that does not resolve, log
+ * unfiltered (capped) rather than going silent -- a noisy trace still names the
+ * blocking call. */
 static int sql_here(void)
 {
-    return g_sqlopen && r_gettid && r_gettid() == g_sql_tid && g_sql_lines < 200;
+    if (!g_sqlopen || g_sql_lines >= 200) return 0;
+    if (r_pthread_self && g_sql_tid) return r_pthread_self() == g_sql_tid;
+    return 1;
 }
 
 static void sql_log(const char *what, long a, long b)
@@ -2144,6 +2153,13 @@ static void sql_log(const char *what, long a, long b)
     s_cat(buf, sizeof buf, &k, " n=");
     put_u(buf, &k, sizeof buf, (unsigned)b, 0);
     log_line("sql    ", buf, "");
+}
+
+static void sql_log_open(const char *path)
+{
+    if (g_sql_lines >= 200) return;
+    g_sql_lines++;
+    log_line("sql    open ", path ? path : "(null)", "");
 }
 
 static void mi_resolve(const char *mangled, void **slot, void *self)
@@ -2248,7 +2264,7 @@ long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
                (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
     mi_enter("zh_maplist_db_open", k);
     /* Watch this thread's syscalls: this is the call that never returns. */
-    g_sql_tid = r_gettid ? r_gettid() : 0;
+    g_sql_tid = r_pthread_self ? r_pthread_self() : 0;
     g_sqlopen = 1;
     r = real ? ((long (*)(void *, void *, void *))real)(a, b, c) : -1;
     g_sqlopen = 0;
