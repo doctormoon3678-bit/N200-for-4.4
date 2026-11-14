@@ -221,6 +221,13 @@ static int   (*r_read)(int, void *, u32);
 static int   (*r_write)(int, const void *, u32);
 static int   (*r_close)(int);
 static int   (*r_fcntl)(int, int, long);
+static int   (*r_usleep)(u32);
+static int   (*r_gettid)(void);
+
+/* Defined in the map-initialize tracer section, used by the libc wrappers
+ * above it. */
+static int  sql_here(void);
+static void sql_log(const char *what, long a, long b);
 
 static char g_data[PATHMAX];     /* read root  -- holds Navkingdom/        */
 static char g_write[PATHMAX];    /* write root -- always writable          */
@@ -704,6 +711,7 @@ static void resolve(void)
     GET(closedir); GET(mkdir); GET(rmdir); GET(unlink); GET(remove);
     GET(rename); GET(utimes); GET(statfs); GET(system);
     GET(read); GET(write); GET(close); GET(fcntl);
+    GET(usleep); GET(gettid);
 #undef GET
 
     if (!r_fopen || !r_open) {
@@ -1180,6 +1188,35 @@ int fdatasync(int fd)
     return fsync_noop("fdatasync");
 }
 
+/*
+ * read/write/usleep: pass-through, but while the map-list SQLite open is on the
+ * main thread, log each one this thread makes just before it runs. The call
+ * that blocks is then the last "sql" line in the log -- a blocking read or
+ * write names the file descriptor, a run of usleep lines means a busy retry
+ * loop. Logging is thread-filtered and capped, and off entirely once the open
+ * returns, so steady-state I/O is untouched.
+ */
+int read(int fd, void *buf, u32 n)
+{
+    if (!r_read) resolve();
+    if (sql_here()) sql_log("read ", fd, (long)n);
+    return r_read ? r_read(fd, buf, n) : -1;
+}
+
+int write(int fd, const void *buf, u32 n)
+{
+    if (!r_write) resolve();
+    if (sql_here()) sql_log("write", fd, (long)n);
+    return r_write ? r_write(fd, buf, n) : -1;
+}
+
+int usleep(u32 usec)
+{
+    if (!r_usleep) resolve();
+    if (sql_here()) sql_log("usleep", (long)usec, 0);
+    return r_usleep ? r_usleep(usec) : -1;
+}
+
 int stat(const char *path, void *st)
 {
     char buf[PATHMAX];
@@ -1391,7 +1428,6 @@ static void n200fs_init(void)
  *  keeps that honest.
  * ====================================================================== */
 
-static int  (*r_usleep)(u32);
 static long (*r_time)(void *);
 static int  (*r_pthread_create)(void *, const void *, void *(*)(void *), void *);
 
@@ -1600,11 +1636,11 @@ static void gps_start(void)
     static unsigned long tid;
     static int started;
     if (!g_gps || started) return;
-    r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
     r_pipe = (void *)dlsym(RTLD_DEFAULT, "pipe");
-    /* r_fcntl is resolved in resolve() from the libc handle; fcntl is now
-     * interposed by this library, so RTLD_DEFAULT here would bind to our own
-     * wrapper and recurse. Make sure it is resolved in case GPS starts first. */
+    /* r_fcntl and r_usleep are resolved in resolve() from the libc handle;
+     * both are now interposed by this library, so RTLD_DEFAULT here would bind
+     * to our own wrappers and recurse. Make sure they are resolved in case GPS
+     * starts first. */
     resolve();
     r_fdopen = (void *)dlsym(RTLD_DEFAULT, "fdopen");
     r_time = (void *)dlsym(RTLD_DEFAULT, "time");
@@ -2082,6 +2118,34 @@ int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
  */
 static int g_mi_lines;
 
+/* While the map-list SQLite open runs on the main thread, every read/write/
+ * usleep that thread makes is logged, so the single call it blocks on is the
+ * last "sql" line in n200fs.log. Keyed on the thread id captured at entry so
+ * the background map loaders' own I/O is not mixed in. */
+static volatile int  g_sqlopen;
+static int           g_sql_tid;
+static int           g_sql_lines;
+
+static int sql_here(void)
+{
+    return g_sqlopen && r_gettid && r_gettid() == g_sql_tid && g_sql_lines < 200;
+}
+
+static void sql_log(const char *what, long a, long b)
+{
+    char buf[80];
+    int k = 0;
+    if (g_sql_lines >= 200) return;
+    g_sql_lines++;
+    s_cat(buf, sizeof buf, &k, what);
+    s_cat(buf, sizeof buf, &k, " fd=");
+    if (a < 0) { s_cat(buf, sizeof buf, &k, "-"); put_u(buf, &k, sizeof buf, (unsigned)-a, 0); }
+    else put_u(buf, &k, sizeof buf, (unsigned)a, 0);
+    s_cat(buf, sizeof buf, &k, " n=");
+    put_u(buf, &k, sizeof buf, (unsigned)b, 0);
+    log_line("sql    ", buf, "");
+}
+
 static void mi_resolve(const char *mangled, void **slot, void *self)
 {
     if (!*slot) {
@@ -2183,7 +2247,11 @@ long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
                &real,
                (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
     mi_enter("zh_maplist_db_open", k);
+    /* Watch this thread's syscalls: this is the call that never returns. */
+    g_sql_tid = r_gettid ? r_gettid() : 0;
+    g_sqlopen = 1;
     r = real ? ((long (*)(void *, void *, void *))real)(a, b, c) : -1;
+    g_sqlopen = 0;
     mi_exit("zh_maplist_db_open", k, r);
     return r;
 }
