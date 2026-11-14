@@ -1141,6 +1141,45 @@ int fcntl(int fd, int cmd, ...)
     }
 }
 
+/*
+ * fsync(2) / fdatasync(2): do not force a flush, just succeed.
+ *
+ * With file locking neutralised the map-list SQLite open got further but still
+ * never returned: its next barrier is the flush it does after writing the
+ * database it is building. The database is redirected onto internal storage,
+ * which on Android 4.4 is itself a FUSE volume (sdcard daemon over ext4), and
+ * an fsync through that layer can stall for many seconds or indefinitely while
+ * a map-sized database is committed page by page -- long enough that the whole
+ * NV_MD render thread never reaches its loop.
+ *
+ * The data is still written; only the explicit "flush to platter now" is
+ * dropped, so the kernel writes it back on its own schedule. For databases and
+ * caches the engine rebuilds every start that is a safe trade, and it is what
+ * SQLite itself does under "PRAGMA synchronous = OFF". Reported, throttled, so
+ * the log shows the flushes that would otherwise have blocked.
+ */
+static int fsync_noop(const char *which)
+{
+    static int n;
+    if (n < 30) {
+        n++;
+        log_line("fsync  ", which, " skipped (would block on FUSE)");
+    }
+    return 0;
+}
+
+int fsync(int fd)
+{
+    (void)fd;
+    return fsync_noop("fsync");
+}
+
+int fdatasync(int fd)
+{
+    (void)fd;
+    return fsync_noop("fdatasync");
+}
+
 int stat(const char *path, void *st)
 {
     char buf[PATHMAX];
