@@ -1971,6 +1971,144 @@ int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
     return real ? real(ch, pulse, msg, timeout) : 0;
 }
 
+/* --- map_initialize sub-call tracer ------------------------------------
+ *
+ * The nvMsg_Receive probe showed channel 6 never runs: the NV_MD main thread
+ * never reaches its render loop. Its last step is process_init() line 1398,
+ * right before map_initialize(), which never returns (line 1403 never prints)
+ * even though every map file loads. So the stall is inside one of
+ * map_initialize's calls. These Navis entry points are all defined in
+ * libHNcommonlib.so and all called from map_initialize; tracing them on entry
+ * and exit makes the blocking one show up in n200fs.log as an "mi->" with no
+ * matching "mi<-". Forwarding uses pointer-width args only (AAPCS r0-r3), so no
+ * struct layout is assumed, and the whole trace is capped so a healthy run does
+ * not flood the log. dlsym on the libHNcommonlib handle returns that library's
+ * own definition (its own symbols are searched before its dependencies), so the
+ * forward reaches the real function, never back into this interposer.
+ */
+static int g_mi_lines;
+
+static void mi_resolve(const char *mangled, void **slot, void *self)
+{
+    if (!*slot) {
+        void *h = dlopen("libHNcommonlib.so", RTLD_NOW);
+        if (h) *slot = dlsym(h, mangled);
+        if (*slot == self) *slot = 0;
+    }
+}
+
+static void mi_enter(const char *name, unsigned n)
+{
+    char b[48];
+    int k = 0;
+    if (g_mi_lines >= 800) return;
+    g_mi_lines++;
+    s_cat(b, sizeof b, &k, name);
+    s_cat(b, sizeof b, &k, " #");
+    put_u(b, &k, sizeof b, n, 0);
+    log_line("mi->   ", b, "");
+}
+
+static void mi_exit(const char *name, unsigned n, long ret)
+{
+    char b[64];
+    int k = 0;
+    if (g_mi_lines >= 800) return;
+    g_mi_lines++;
+    s_cat(b, sizeof b, &k, name);
+    s_cat(b, sizeof b, &k, " #");
+    put_u(b, &k, sizeof b, n, 0);
+    s_cat(b, sizeof b, &k, " = ");
+    if (ret < 0) {
+        s_cat(b, sizeof b, &k, "-");
+        put_u(b, &k, sizeof b, (unsigned)(-ret), 0);
+    } else {
+        put_u(b, &k, sizeof b, (unsigned)ret, 0);
+    }
+    log_line("mi<-   ", b, "");
+}
+
+long _Z6z_OpenPcP16SNavisFileHandle(void *a, void *b);
+long _Z6z_OpenPcP16SNavisFileHandle(void *a, void *b)
+{
+    static void *real;
+    static unsigned n;
+    unsigned c = n++;
+    long r;
+    mi_resolve("_Z6z_OpenPcP16SNavisFileHandle", &real,
+               (void *)_Z6z_OpenPcP16SNavisFileHandle);
+    mi_enter("z_Open", c);
+    r = real ? ((long (*)(void *, void *))real)(a, b) : -1;
+    mi_exit("z_Open", c, r);
+    return r;
+}
+
+long _Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader(
+        void *a, void *b);
+long _Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader(
+        void *a, void *b)
+{
+    static void *real;
+    static unsigned n;
+    unsigned c = n++;
+    long r;
+    mi_resolve("_Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader",
+               &real,
+               (void *)_Z14zPSyncInfoLoadP16SNavisFileHandleP24SZFPartialSyncInfoHeader);
+    mi_enter("zPSyncInfoLoad", c);
+    r = real ? ((long (*)(void *, void *))real)(a, b) : -1;
+    mi_exit("zPSyncInfoLoad", c, r);
+    return r;
+}
+
+long _Z16zh_basefile_initPvPii(void *a, void *b, long c);
+long _Z16zh_basefile_initPvPii(void *a, void *b, long c)
+{
+    static void *real;
+    static unsigned n;
+    unsigned k = n++;
+    long r;
+    mi_resolve("_Z16zh_basefile_initPvPii", &real,
+               (void *)_Z16zh_basefile_initPvPii);
+    mi_enter("zh_basefile_init", k);
+    r = real ? ((long (*)(void *, void *, long))real)(a, b, c) : -1;
+    mi_exit("zh_basefile_init", k, r);
+    return r;
+}
+
+long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
+        void *a, void *b, void *c);
+long _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
+        void *a, void *b, void *c)
+{
+    static void *real;
+    static unsigned n;
+    unsigned k = n++;
+    long r;
+    mi_resolve("_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo",
+               &real,
+               (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
+    mi_enter("zh_maplist_db_open", k);
+    r = real ? ((long (*)(void *, void *, void *))real)(a, b, c) : -1;
+    mi_exit("zh_maplist_db_open", k, r);
+    return r;
+}
+
+long _Z18zh_vertexfile_initPvPii(void *a, void *b, long c);
+long _Z18zh_vertexfile_initPvPii(void *a, void *b, long c)
+{
+    static void *real;
+    static unsigned n;
+    unsigned k = n++;
+    long r;
+    mi_resolve("_Z18zh_vertexfile_initPvPii", &real,
+               (void *)_Z18zh_vertexfile_initPvPii);
+    mi_enter("zh_vertexfile_init", k);
+    r = real ? ((long (*)(void *, void *, long))real)(a, b, c) : -1;
+    mi_exit("zh_vertexfile_init", k, r);
+    return r;
+}
+
 /* ====================================================================== *
  *  Capturing the engine's own trace
  *
