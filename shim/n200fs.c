@@ -2168,6 +2168,74 @@ int pthread_mutex_init(void *m, const void *attr)
     return real(m, &a);
 }
 
+/* --- break the deadlock on the global DB mutex ----------------------------
+ * The backtrace of the wedged MV_Main thread resolved to:
+ *   zh_sqlite_MapList_Open -> CNavisSQLAccess::Open -> CHNACEThreadMutex::acquire
+ *   -> COSW_Mutex::Lock -> pthread_mutex_lock -> futex (forever)
+ * CNavisSQLAccess serialises every sqlite database behind one process-wide
+ * COSW_Mutex. Another thread took that mutex and never gave it back -- it
+ * exited while holding it, or is itself deadlocked -- and no other thread is
+ * in I/O, so the lock will never come free on its own. Forcing the mutex
+ * recursive did not help because the holder is a *different* thread.
+ *
+ * COSW_Mutex::Lock is defined in libNFCOSWrapper.so and imported by
+ * libHNcommonlib, so it is interposed here. It is a thin wrapper that locks
+ * the pthread_mutex at *(this+8). Instead of blocking forever, poll it: a free
+ * or self-owned (recursive) lock is taken at once; a lock still held after
+ * three seconds is treated as a dead hold -- log it, remember it, and proceed
+ * without it so the DB open can finish. A remembered mutex is skipped straight
+ * away next time, so startup is delayed by three seconds once, not per call.
+ * A genuinely uncontended lock -- the overwhelming majority -- is unaffected.
+ *
+ * Proceeding without the lock is safe here: the holder is gone, so there is no
+ * real concurrent writer to race, and the later COSW_Mutex::Unlock on a mutex
+ * this thread does not own simply fails (EPERM) without touching its state. */
+static void *g_stuck_mtx[16];
+static int mtx_known_stuck(void *m)
+{
+    int i;
+    for (i = 0; i < 16; i++) if (g_stuck_mtx[i] == m) return 1;
+    return 0;
+}
+static void mtx_mark_stuck(void *m)
+{
+    int i;
+    for (i = 0; i < 16; i++) if (!g_stuck_mtx[i]) { g_stuck_mtx[i] = m; return; }
+}
+
+int _ZN10COSW_Mutex4LockEv(void *self);
+int _ZN10COSW_Mutex4LockEv(void *self)
+{
+    static int (*trylock)(void *);
+    static int (*lock)(void *);
+    static int (*usl)(u32);
+    static int tried;
+    void *pm;
+    int i;
+    if (!tried) {
+        tried = 1;
+        if (g_libc) {
+            trylock = (int (*)(void *))dlsym(g_libc, "pthread_mutex_trylock");
+            lock    = (int (*)(void *))dlsym(g_libc, "pthread_mutex_lock");
+            usl     = (int (*)(u32))dlsym(g_libc, "usleep");
+        }
+    }
+    pm = self ? *(void **)((char *)self + 8) : 0;
+    if (!pm) return 0;                         /* nothing to lock             */
+    if (!trylock) return lock ? lock(pm) : 0;  /* fall back to real blocking  */
+    if (trylock(pm) == 0) return 0;            /* free or recursively ours    */
+    if (mtx_known_stuck(self)) return 0;       /* already known dead: skip    */
+    for (i = 0; i < 300; i++) {                /* up to ~3 s                  */
+        if (usl) usl(10000);
+        if (trylock(pm) == 0) return 0;
+    }
+    mtx_mark_stuck(self);
+    log_line("mutex  ",
+             "COSW_Mutex held >3s by a gone thread -- proceeding without it",
+             "");
+    return 0;
+}
+
 /* --- watchdog: name the exact syscall map_initialize's thread is stuck in ---
  * If zh_maplist_db_open does not return within a few seconds, read the calling
  * thread's /proc/self/task/<tid>/{comm,wchan,syscall,stat}. wchan is the kernel
