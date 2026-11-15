@@ -607,7 +607,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v9-UNLOCK\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -1713,9 +1713,12 @@ static void maybe_dump_maps(void)
     static int count;
     static long last;
     long t;
-    if (count >= 8) return;
+    if (count >= 10) return;
     t = now_s();
-    if (count == 0) { last = t; dump_maps((unsigned)count++); return; }
+    /* The first few snapshots go out back-to-back, not 3s apart, so that even
+     * a crash in the first second or two still has a /proc/self/maps to be
+     * resolved against. After that, one every few seconds. */
+    if (count < 4) { last = t; dump_maps((unsigned)count++); return; }
     if (t - last >= 3) { last = t; dump_maps((unsigned)count++); }
 }
 
