@@ -1058,6 +1058,39 @@ void *fopen(const char *path, const char *mode)
     return f;
 }
 
+/*
+ * Overlay copy-up.
+ *
+ * The writable root starts empty, but many files the app opens for writing
+ * already exist, pre-built, on the read-only card -- the map's SQLite databases
+ * above all (maplist4MV.idx, zMapUnit.idx, map_list.idx). Giving the engine the
+ * empty internal copy makes it try to rebuild the database from scratch, and on
+ * a phone that rebuild stalls the whole map thread before it ever draws. So the
+ * first time such a file is opened for writing, if the card holds it and the
+ * writable root does not yet, copy the card's copy across. The engine then opens
+ * a valid database and skips the rebuild. Truncating opens are skipped: the
+ * caller is replacing the contents anyway.
+ */
+static void copy_up(const char *rest, const char *dst)
+{
+    char src[PATHMAX];
+    char cbuf[16384];
+    int fin, fout, n;
+    if (!r_open || !r_read || !r_write || !r_close || !r_access) return;
+    if (!join_rest(src, sizeof src, g_data, rest)) return;
+    if (r_access(src, 0) != 0) return;                 /* no card original    */
+    fin = r_open(src, 0 /* O_RDONLY */, 0);
+    if (fin < 0) return;
+    make_parents(dst);
+    fout = r_open(dst, 1 | 0100 | 01000 /* O_WRONLY|O_CREAT|O_TRUNC */, 0644);
+    if (fout < 0) { r_close(fin); return; }
+    while ((n = r_read(fin, cbuf, sizeof cbuf)) > 0)
+        r_write(fout, cbuf, (u32)n);
+    r_close(fin);
+    r_close(fout);
+    log_line("copyup ", rest, " (card copy -> writable root)");
+}
+
 int open(const char *path, int flags, ...)
 {
     char buf[PATHMAX];
@@ -1080,6 +1113,13 @@ int open(const char *path, int flags, ...)
     { const char *rest; ours = strip_root(path, &rest) || worth_reporting(path); }
     w = (flags & O_ACCMODE) != 0 || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
     m = map_path(path, w, buf, sizeof buf);
+    /* Writable file that exists on the card but not yet in the writable root:
+     * bring the card's copy across so the engine does not rebuild it. */
+    if (w && !(flags & O_TRUNC)) {
+        const char *rest;
+        if (strip_root(path, &rest) && r_access && r_access(m, 0) != 0)
+            copy_up(rest, m);
+    }
     fd = r_open(m, flags, mode);
     if (ours) {
         if (fd >= 0) log_ok(w ? "w " : "r ", path);
