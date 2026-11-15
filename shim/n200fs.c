@@ -1659,6 +1659,49 @@ static long now_s(void)
     return t ? t(0) : 0;
 }
 
+/* ---- /proc/self/maps snapshot, for placing crash addresses ---------------
+ * The engine's crash reporter (CNS2K's android_sigaction) prints raw frame
+ * addresses and "fail dladdr(...)". dladdr can only name DT-registered shared
+ * objects, so an address in an anonymous mapping, the oat/dex image or the ART
+ * heap comes back unresolved -- which is exactly what a jump through a corrupt
+ * function pointer produces. /proc/self/maps lists every mapping, so dumping it
+ * into the same log lets those addresses be placed by hand against this exact
+ * run (a library's base is fixed once it is mapped). Driven from the engine's
+ * own logging call and throttled, so a fresh snapshot always exists shortly
+ * before any crash. Read and write go straight through the raw libc pointers,
+ * never back through __android_log_print, so there is no recursion. */
+static void dump_maps(unsigned tag)
+{
+    char p[PATHMAX], buf[4096], h[48];
+    int mfd, lfd, n, hn = 0;
+    if (!r_open || !r_read || !r_write || !g_write[0]) return;
+    if (!join(p, sizeof p, g_write, "n200fs.log")) return;
+    s_cat(h, sizeof h, &hn, "==== maps #");
+    put_u(h, &hn, sizeof h, tag, 0);
+    log_line(h, " ====", "");
+    mfd = r_open("/proc/self/maps", 0 /* O_RDONLY */, 0);
+    if (mfd < 0) { log_line("maps: cannot open /proc/self/maps", "", ""); return; }
+    lfd = r_open(p, 1 | 0100 | 02000 /* O_WRONLY|O_CREAT|O_APPEND */, 0644);
+    if (lfd >= 0) {
+        while ((n = r_read(mfd, buf, sizeof buf)) > 0)
+            r_write(lfd, buf, (u32)n);
+        if (r_close) r_close(lfd);
+    }
+    if (r_close) r_close(mfd);
+    log_line("==== end maps ====", "", "");
+}
+
+static void maybe_dump_maps(void)
+{
+    static int count;
+    static long last;
+    long t;
+    if (count >= 8) return;
+    t = now_s();
+    if (count == 0) { last = t; dump_maps((unsigned)count++); return; }
+    if (t - last >= 3) { last = t; dump_maps((unsigned)count++); }
+}
+
 static int gate_real(struct gate *g, int (*self)(void))
 {
     int v;
@@ -2330,6 +2373,8 @@ int __android_log_print(int prio, const char *tag, const char *fmt, ...)
     static int tried, count;
     __builtin_va_list ap;
     int r = 0;
+
+    maybe_dump_maps();   /* snapshot /proc/self/maps a few times before any crash */
 
     if (!tried) {
         void *h;
