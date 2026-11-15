@@ -60,8 +60,11 @@ cat > "$WORK/export.map" <<'EOF'
   global:
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
-    utimes; statfs; system; strcasecmp;
+    utimes; statfs; system; strcasecmp; fcntl;
     n200fs_note;
+    _Z16zh_basefile_initPvPii;
+    _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo;
+    _Z18zh_vertexfile_initPvPii;
     __android_log_print;
     _Z22NaviGetNaviSDCardStatev;
     _Z22mdGetFirstLayerOnStatev;
@@ -118,7 +121,10 @@ fi
 #    by the app's libraries in place of libc's, which is how you break a
 #    program you meant to fix.
 want="_Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi
+_Z16zh_basefile_initPvPii
 _Z17NaviChkFirstMountv
+_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo
+_Z18zh_vertexfile_initPvPii
 _Z21NaviGetMapInitialDonev
 _Z22NaviGetNaviSDCardStatev
 _Z22mdGetFirstLayerOnStatev
@@ -131,6 +137,7 @@ _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
 __android_log_print
 access
+fcntl
 fopen
 mkdir
 n200fs_note

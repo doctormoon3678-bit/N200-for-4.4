@@ -227,6 +227,7 @@ static char g_mounts[512];       /* storage mount points, for the log      */
 static int  g_enginelog = 1;     /* switch on the engine's own log file     */
 static volatile int g_ready;     /* 1 once both roots are usable           */
 static volatile int g_busy;      /* re-entry guard for the resolve step    */
+static void *g_libc;             /* handle on libc.so, for real_* lookups  */
 
 /*
  * Fallback mount points, used after /proc/mounts has been searched. These are
@@ -695,6 +696,7 @@ static void resolve(void)
      * touches no file. RTLD_DEFAULT is the fallback: the linker walks the
      * solist from the start, where libc sits long before this library. */
     c = dlopen(N200FS_LIBC, RTLD_NOW);
+    g_libc = c;
 #define GET(f) do { \
         r_##f = (void *)dlsym(c ? c : RTLD_DEFAULT, #f); \
         if (!r_##f && c) r_##f = (void *)dlsym(RTLD_DEFAULT, #f); \
@@ -1551,7 +1553,11 @@ static void gps_start(void)
     if (!g_gps || started) return;
     r_usleep = (void *)dlsym(RTLD_DEFAULT, "usleep");
     r_pipe = (void *)dlsym(RTLD_DEFAULT, "pipe");
-    r_fcntl = (void *)dlsym(RTLD_DEFAULT, "fcntl");
+    /* libc's fcntl, not this library's interposed one below -- the GPS pipe
+     * only ever sets O_NONBLOCK, which the interposer forwards anyway, but
+     * binding straight to libc keeps it independent of that path. */
+    r_fcntl = (void *)dlsym(g_libc ? g_libc : RTLD_DEFAULT, "fcntl");
+    if (!r_fcntl) r_fcntl = (void *)dlsym(RTLD_DEFAULT, "fcntl");
     r_fdopen = (void *)dlsym(RTLD_DEFAULT, "fdopen");
     r_time = (void *)dlsym(RTLD_DEFAULT, "time");
     r_pthread_create = (void *)dlsym(RTLD_DEFAULT, "pthread_create");
@@ -2052,6 +2058,118 @@ int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
         }
     }
     return real ? real(ch, pulse, msg, timeout) : 0;
+}
+
+/* ====================================================================== *
+ *  Unblocking map_initialize(): POSIX file-lock no-op
+ *
+ *  process_init() logs milestone 1398 (right before it calls map_initialize)
+ *  and never logs 1403 (right after), so map_initialize() does not return.
+ *  Statically it is a linear sequence of three data-init calls into
+ *  libHNcommonlib.so -- zh_basefile_init, zh_maplist_db_open, zh_vertexfile_init
+ *  -- so the main map thread is wedged inside one of them.
+ *
+ *  zh_maplist_db_open opens the maplist as an sqlite database (maplist4MV.idx,
+ *  on the SD card). sqlite guards every database with POSIX advisory locks
+ *  (fcntl F_SETLK/F_SETLKW). The map data sits on a vfat/FUSE-backed SD card,
+ *  where those locks either are not honoured or block forever against a stale
+ *  holder; sqlite then either spins in its busy handler or waits in F_SETLKW,
+ *  and the open never completes. This is the single most common way sqlite
+ *  hangs on Android external storage.
+ *
+ *  In a single-process app advisory file locks are meaningless -- nothing else
+ *  contends for these files -- so granting every lock immediately is correct
+ *  and removes the hang. Only the lock commands are answered here; every other
+ *  fcntl (F_GETFL/F_SETFL/F_SETFD/F_DUPFD ...) is forwarded to libc untouched.
+ *  The third argument is taken as one word and forwarded as-is, which is right
+ *  for both the int-valued and the struct flock* commands on this ABI.
+ * ====================================================================== */
+#define N200_F_GETLK   5
+#define N200_F_SETLK   6
+#define N200_F_SETLKW  7
+#define N200_F_GETLK64 12
+#define N200_F_SETLK64 13
+#define N200_F_SETLKW64 14
+#define N200_F_UNLCK   2        /* struct flock.l_type meaning "no lock" */
+
+int fcntl(int fd, int cmd, void *arg);
+int fcntl(int fd, int cmd, void *arg)
+{
+    static int (*real)(int, int, void *);
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        if (g_libc) real = (int (*)(int, int, void *))dlsym(g_libc, "fcntl");
+        if ((void *)real == (void *)fcntl) real = 0;   /* never ourselves */
+    }
+    switch (cmd) {
+    case N200_F_SETLK:  case N200_F_SETLKW:
+    case N200_F_SETLK64: case N200_F_SETLKW64:
+        return 0;                               /* grant the lock, silently */
+    case N200_F_GETLK:  case N200_F_GETLK64:
+        if (arg) *(short *)arg = N200_F_UNLCK;  /* report: nobody holds it  */
+        return 0;
+    default:
+        return real ? real(fd, cmd, arg) : -1;
+    }
+}
+
+/* --- map_initialize progress probe ----------------------------------------
+ * Bracket the three data-init calls with ENTER/EXIT lines so that, if the
+ * fcntl fix above is not enough, the one function with an ENTER and no EXIT
+ * names exactly where the main map thread is still wedged. All three are
+ * imported by libNV_MD/RP/POS and defined in libHNcommonlib.so; this library
+ * is first in their DT_NEEDED, so the calls land here and are forwarded on. */
+static void *hn_sym(const char *name, void *self)
+{
+    static void *h;
+    void *p;
+    if (!h) h = dlopen("libHNcommonlib.so", RTLD_NOW);
+    if (!h) return 0;
+    p = dlsym(h, name);
+    return p == self ? 0 : p;
+}
+
+int _Z16zh_basefile_initPvPii(void *a, int *b, int c);
+int _Z16zh_basefile_initPvPii(void *a, int *b, int c)
+{
+    static int (*real)(void *, int *, int);
+    int r;
+    if (!real) real = (int (*)(void *, int *, int))
+        hn_sym("_Z16zh_basefile_initPvPii", (void *)_Z16zh_basefile_initPvPii);
+    log_line("mapinit", " zh_basefile_init ENTER", "");
+    r = real ? real(a, b, c) : -1;
+    log_line("mapinit", " zh_basefile_init EXIT", "");
+    return r;
+}
+
+int _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
+        char *a, void **b, void **c);
+int _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
+        char *a, void **b, void **c)
+{
+    static int (*real)(char *, void **, void **);
+    int r;
+    if (!real) real = (int (*)(char *, void **, void **))hn_sym(
+        "_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo",
+        (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
+    log_line("mapinit", " zh_maplist_db_open ENTER", "");
+    r = real ? real(a, b, c) : -1;
+    log_line("mapinit", " zh_maplist_db_open EXIT", "");
+    return r;
+}
+
+int _Z18zh_vertexfile_initPvPii(void *a, int *b, int c);
+int _Z18zh_vertexfile_initPvPii(void *a, int *b, int c)
+{
+    static int (*real)(void *, int *, int);
+    int r;
+    if (!real) real = (int (*)(void *, int *, int))
+        hn_sym("_Z18zh_vertexfile_initPvPii", (void *)_Z18zh_vertexfile_initPvPii);
+    log_line("mapinit", " zh_vertexfile_init ENTER", "");
+    r = real ? real(a, b, c) : -1;
+    log_line("mapinit", " zh_vertexfile_init EXIT", "");
+    return r;
 }
 
 /* ====================================================================== *
