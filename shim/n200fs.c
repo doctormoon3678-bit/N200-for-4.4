@@ -609,7 +609,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v11-oil\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v12-dbwait\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -2237,13 +2237,20 @@ int _ZN10COSW_Mutex4LockEv(void *self)
     if (!trylock) return lock ? lock(pm) : 0;  /* fall back to real blocking  */
     if (trylock(pm) == 0) return 0;            /* free or recursively ours    */
     if (mtx_known_stuck(self)) return 0;       /* already known dead: skip    */
-    for (i = 0; i < 300; i++) {                /* up to ~3 s                  */
+    /* Wait a long time before declaring a deadlock. The first-mount index
+     * rebuild holds this global DB mutex while it scans the map units and
+     * writes the maplist, which on a slow SD card takes far longer than a few
+     * seconds; a short timeout cut that rebuild off and left the tile index
+     * (maplist4MV) empty, so every tile lookup returned mapid=-1 and the map
+     * drew blank. 45s lets the rebuild finish and release the lock normally;
+     * only a lock still held after that is treated as a genuinely dead hold. */
+    for (i = 0; i < 4500; i++) {               /* up to ~45 s                 */
         if (usl) usl(10000);
         if (trylock(pm) == 0) return 0;
     }
     mtx_mark_stuck(self);
     log_line("mutex  ",
-             "COSW_Mutex held >3s by a gone thread -- proceeding without it",
+             "COSW_Mutex held >45s -- treating as dead and proceeding without it",
              "");
     return 0;
 }
