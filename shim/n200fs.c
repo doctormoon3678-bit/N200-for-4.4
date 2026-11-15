@@ -2118,6 +2118,45 @@ int fcntl(int fd, int cmd, void *arg)
     }
 }
 
+/* --- force recursive mutexes ----------------------------------------------
+ * The watchdog proved map_initialize's thread (MV_Main) is wedged in
+ * futex(FUTEX_WAIT) on a heap pthread_mutex while it opens the maplist sqlite
+ * DB, with every other thread still looping -- the signature of a self
+ * deadlock: the thread takes a non-recursive mutex and, several frames deeper,
+ * takes the same one again and waits on itself forever. Making every mutex
+ * this process initialises recursive lets the owning thread re-enter its own
+ * lock; for code whose lock/unlock already pair up this changes nothing. The
+ * caller's attribute is preserved and only its type is switched to recursive.
+ * bionic's pthread_mutexattr_t is a single int. */
+#define N200_PTHREAD_MUTEX_RECURSIVE 1
+int pthread_mutex_init(void *m, const void *attr);
+int pthread_mutex_init(void *m, const void *attr)
+{
+    static int (*real)(void *, const void *);
+    static int (*at_init)(void *);
+    static int (*at_settype)(void *, int);
+    static int tried;
+    int a;
+    if (!tried) {
+        tried = 1;
+        if (g_libc) {
+            real = (int (*)(void *, const void *))
+                   dlsym(g_libc, "pthread_mutex_init");
+            at_init = (int (*)(void *))dlsym(g_libc, "pthread_mutexattr_init");
+            at_settype = (int (*)(void *, int))
+                         dlsym(g_libc, "pthread_mutexattr_settype");
+        }
+        if ((void *)real == (void *)pthread_mutex_init) real = 0;
+    }
+    if (!real) return -1;
+    if (!at_settype) return real(m, attr);
+    if (attr) a = *(const int *)attr;
+    else if (at_init) at_init(&a);
+    else a = 0;
+    at_settype(&a, N200_PTHREAD_MUTEX_RECURSIVE);
+    return real(m, &a);
+}
+
 /* --- watchdog: name the exact syscall map_initialize's thread is stuck in ---
  * If zh_maplist_db_open does not return within a few seconds, read the calling
  * thread's /proc/self/task/<tid>/{comm,wchan,syscall,stat}. wchan is the kernel
@@ -2155,6 +2194,30 @@ static void wd_read(const char *leaf, int tid, const char *when)
     log_line(tag, buf, "");
 }
 
+/* Dump comm+wchan for every thread, so a mutex held by another (stuck) thread
+ * shows up: that would be a cross-thread deadlock rather than a self one. */
+static void *(*r_readdir)(void *);
+static void dump_all_threads(const char *when)
+{
+    void *dir, *ent;
+    if (!r_opendir) return;
+    if (!r_readdir && g_libc)
+        r_readdir = (void *(*)(void *))dlsym(g_libc, "readdir");
+    if (!r_readdir) return;
+    dir = r_opendir("/proc/self/task");
+    if (!dir) { log_line("wd ", "cannot list /proc/self/task", ""); return; }
+    while ((ent = r_readdir(dir)) != 0) {
+        const char *nm = (const char *)ent + 19;   /* bionic dirent.d_name */
+        int tid = 0, i;
+        if (nm[0] < '0' || nm[0] > '9') continue;  /* skip "." and ".."     */
+        for (i = 0; nm[i] >= '0' && nm[i] <= '9'; i++)
+            tid = tid * 10 + (nm[i] - '0');
+        wd_read("comm", tid, when);
+        wd_read("wchan", tid, when);
+    }
+    if (r_closedir) r_closedir(dir);
+}
+
 static void *ml_watchdog(void *arg)
 {
     (void)arg;
@@ -2166,11 +2229,8 @@ static void *ml_watchdog(void *arg)
         wd_read("wchan", g_ml_tid, "t12");
         wd_read("syscall", g_ml_tid, "t12");
         wd_read("stat", g_ml_tid, "t12");
-    }
-    if (r_wd_usleep) r_wd_usleep(13000000);
-    if (!g_ml_done && g_ml_tid) {
-        wd_read("wchan", g_ml_tid, "t25");
-        wd_read("syscall", g_ml_tid, "t25");
+        log_line("wd ---- all threads ----", "", "");
+        dump_all_threads("all");
     }
     return 0;
 }
