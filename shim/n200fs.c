@@ -2090,6 +2090,9 @@ int _Z13nvMsg_ReceiveiPFiiP8NV_PULSEEPFiiP13NV_MSG_HEADEREi(
 #define N200_F_GETLK64 12
 #define N200_F_SETLK64 13
 #define N200_F_SETLKW64 14
+#define N200_F_OFD_GETLK  36
+#define N200_F_OFD_SETLK  37
+#define N200_F_OFD_SETLKW 38
 #define N200_F_UNLCK   2        /* struct flock.l_type meaning "no lock" */
 
 int fcntl(int fd, int cmd, void *arg);
@@ -2105,13 +2108,86 @@ int fcntl(int fd, int cmd, void *arg)
     switch (cmd) {
     case N200_F_SETLK:  case N200_F_SETLKW:
     case N200_F_SETLK64: case N200_F_SETLKW64:
+    case N200_F_OFD_SETLK: case N200_F_OFD_SETLKW:
         return 0;                               /* grant the lock, silently */
-    case N200_F_GETLK:  case N200_F_GETLK64:
+    case N200_F_GETLK:  case N200_F_GETLK64:  case N200_F_OFD_GETLK:
         if (arg) *(short *)arg = N200_F_UNLCK;  /* report: nobody holds it  */
         return 0;
     default:
         return real ? real(fd, cmd, arg) : -1;
     }
+}
+
+/* --- watchdog: name the exact syscall map_initialize's thread is stuck in ---
+ * If zh_maplist_db_open does not return within a few seconds, read the calling
+ * thread's /proc/self/task/<tid>/{comm,wchan,syscall,stat}. wchan is the kernel
+ * function it sleeps in (futex_* => a pthread mutex/cond; a vfs read/fsync =>
+ * I/O) and syscall gives the number and arguments, so the log says outright
+ * whether the open is wedged on a lock, a mutex, an fsync or a read -- without
+ * which every fix is a guess. gettid/usleep/pthread_create are taken straight
+ * from libc so this works in the GPS-off build too. */
+static int    (*r_gettid)(void);
+static int    (*r_wd_usleep)(u32);
+static int    (*r_wd_pcreate)(void *, const void *, void *(*)(void *), void *);
+static volatile int g_ml_tid, g_ml_done;
+
+static void wd_read(const char *leaf, int tid, const char *when)
+{
+    char path[128], buf[400], tag[64];
+    int fd, n = 0, pn = 0, tn = 0;
+    s_cat(path, sizeof path, &pn, "/proc/self/task/");
+    put_u(path, &pn, sizeof path, (unsigned)tid, 0);
+    s_cat(path, sizeof path, &pn, "/");
+    s_cat(path, sizeof path, &pn, leaf);
+    s_cat(tag, sizeof tag, &tn, "wd ");
+    s_cat(tag, sizeof tag, &tn, when);
+    s_cat(tag, sizeof tag, &tn, " ");
+    s_cat(tag, sizeof tag, &tn, leaf);
+    s_cat(tag, sizeof tag, &tn, "=");
+    fd = r_open ? r_open(path, 0, 0) : -1;
+    if (fd < 0) { log_line(tag, "(unreadable)", ""); return; }
+    n = r_read ? r_read(fd, buf, sizeof buf - 1) : 0;
+    if (r_close) r_close(fd);
+    if (n < 0) n = 0;
+    buf[n] = 0;
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == ' ' || buf[n-1] == '\t'))
+        buf[--n] = 0;
+    log_line(tag, buf, "");
+}
+
+static void *ml_watchdog(void *arg)
+{
+    (void)arg;
+    if (r_wd_usleep) r_wd_usleep(12000000);
+    if (!g_ml_done && g_ml_tid) {
+        log_line("wd zh_maplist_db_open still blocked after 12s; thread state:",
+                 "", "");
+        wd_read("comm", g_ml_tid, "t12");
+        wd_read("wchan", g_ml_tid, "t12");
+        wd_read("syscall", g_ml_tid, "t12");
+        wd_read("stat", g_ml_tid, "t12");
+    }
+    if (r_wd_usleep) r_wd_usleep(13000000);
+    if (!g_ml_done && g_ml_tid) {
+        wd_read("wchan", g_ml_tid, "t25");
+        wd_read("syscall", g_ml_tid, "t25");
+    }
+    return 0;
+}
+
+static void ml_watchdog_start(void)
+{
+    static unsigned long tid;
+    if (!r_gettid && g_libc)
+        r_gettid = (int (*)(void))dlsym(g_libc, "gettid");
+    if (!r_wd_usleep && g_libc)
+        r_wd_usleep = (int (*)(u32))dlsym(g_libc, "usleep");
+    if (!r_wd_pcreate && g_libc)
+        r_wd_pcreate = (int (*)(void *, const void *, void *(*)(void *),
+                                void *))dlsym(g_libc, "pthread_create");
+    g_ml_tid = r_gettid ? r_gettid() : 0;
+    g_ml_done = 0;
+    if (r_wd_pcreate) r_wd_pcreate(&tid, 0, ml_watchdog, 0);
 }
 
 /* --- map_initialize progress probe ----------------------------------------
@@ -2154,7 +2230,9 @@ int _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo(
         "_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo",
         (void *)_Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo);
     log_line("mapinit", " zh_maplist_db_open ENTER", "");
+    ml_watchdog_start();
     r = real ? real(a, b, c) : -1;
+    g_ml_done = 1;
     log_line("mapinit", " zh_maplist_db_open EXIT", "");
     return r;
 }
