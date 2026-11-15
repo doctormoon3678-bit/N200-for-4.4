@@ -609,7 +609,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v12-dbwait\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v13-holder\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -2215,43 +2215,98 @@ static void mtx_mark_stuck(void *m)
     for (i = 0; i < 16; i++) if (!g_stuck_mtx[i]) { g_stuck_mtx[i] = m; return; }
 }
 
+/* Who holds each COSW_Mutex, so a Lock that times out can name and backtrace
+ * the holder -- the thread deadlocked while holding the global DB mutex. */
+static void dump_stack(int tid);            /* defined later (watchdog section) */
+static int  (*cosw_gettid)(void);
+static void *g_cosw_pm[32];
+static int   g_cosw_tid[32];
+static void cosw_set_owner(void *pm, int tid)
+{
+    int i, free = -1;
+    for (i = 0; i < 32; i++) {
+        if (g_cosw_pm[i] == pm) { g_cosw_tid[i] = tid; return; }
+        if (free < 0 && !g_cosw_pm[i]) free = i;
+    }
+    if (free >= 0) { g_cosw_pm[free] = pm; g_cosw_tid[free] = tid; }
+}
+static int cosw_owner(void *pm)
+{
+    int i;
+    for (i = 0; i < 32; i++) if (g_cosw_pm[i] == pm) return g_cosw_tid[i];
+    return 0;
+}
+static void cosw_clear_owner(void *pm)
+{
+    int i;
+    for (i = 0; i < 32; i++) if (g_cosw_pm[i] == pm) { g_cosw_tid[i] = 0; return; }
+}
+
+int _ZN10COSW_Mutex6UnlockEv(void *self);
+int _ZN10COSW_Mutex6UnlockEv(void *self)
+{
+    static int (*real)(void *);
+    static int tried;
+    void *pm;
+    if (!tried) { tried = 1; if (g_libc) real = (int (*)(void *))
+                     dlsym(g_libc, "pthread_mutex_unlock"); }
+    pm = self ? *(void **)((char *)self + 8) : 0;
+    if (pm) cosw_clear_owner(pm);
+    return (pm && real) ? real(pm) : 0;
+}
+
 int _ZN10COSW_Mutex4LockEv(void *self);
 int _ZN10COSW_Mutex4LockEv(void *self)
 {
     static int (*trylock)(void *);
     static int (*lock)(void *);
     static int (*usl)(u32);
-    static int tried;
+    static int tried, backtraced;
     void *pm;
-    int i;
+    int i, holder;
     if (!tried) {
         tried = 1;
         if (g_libc) {
             trylock = (int (*)(void *))dlsym(g_libc, "pthread_mutex_trylock");
             lock    = (int (*)(void *))dlsym(g_libc, "pthread_mutex_lock");
             usl     = (int (*)(u32))dlsym(g_libc, "usleep");
+            cosw_gettid = (int (*)(void))dlsym(g_libc, "gettid");
         }
     }
     pm = self ? *(void **)((char *)self + 8) : 0;
     if (!pm) return 0;                         /* nothing to lock             */
-    if (!trylock) return lock ? lock(pm) : 0;  /* fall back to real blocking  */
-    if (trylock(pm) == 0) return 0;            /* free or recursively ours    */
-    if (mtx_known_stuck(self)) return 0;       /* already known dead: skip    */
-    /* Wait a long time before declaring a deadlock. The first-mount index
-     * rebuild holds this global DB mutex while it scans the map units and
-     * writes the maplist, which on a slow SD card takes far longer than a few
-     * seconds; a short timeout cut that rebuild off and left the tile index
-     * (maplist4MV) empty, so every tile lookup returned mapid=-1 and the map
-     * drew blank. 45s lets the rebuild finish and release the lock normally;
-     * only a lock still held after that is treated as a genuinely dead hold. */
-    for (i = 0; i < 4500; i++) {               /* up to ~45 s                 */
+    if (!trylock) {                            /* fall back to real blocking  */
+        if (lock && lock(pm) == 0 && cosw_gettid) cosw_set_owner(pm, cosw_gettid());
+        return 0;
+    }
+    if (trylock(pm) == 0) {                     /* free or recursively ours    */
+        if (cosw_gettid) cosw_set_owner(pm, cosw_gettid());
+        return 0;
+    }
+    if (mtx_known_stuck(self)) return 0;        /* already known dead: skip    */
+    /* Poll rather than block. A legitimately slow holder (the first-mount index
+     * rebuild) releases within a few seconds and the lock is then taken here. A
+     * lock still held after ~15 s is a real cross-thread deadlock: name and
+     * backtrace the holder once (so the deadlock can be understood), then
+     * proceed without it so the app does not hang forever. */
+    for (i = 0; i < 1500; i++) {               /* up to ~15 s                 */
         if (usl) usl(10000);
-        if (trylock(pm) == 0) return 0;
+        if (trylock(pm) == 0) {
+            if (cosw_gettid) cosw_set_owner(pm, cosw_gettid());
+            return 0;
+        }
+    }
+    holder = cosw_owner(pm);
+    if (!backtraced) {
+        char b[32]; int n = 0;
+        backtraced = 1;
+        s_cat(b, sizeof b, &n, "COSW_Mutex deadlock; holder tid=");
+        put_u(b, &n, sizeof b, (unsigned)holder, 0);
+        log_line("mutex  ", b, "");
+        if (holder > 0) dump_stack(holder);
     }
     mtx_mark_stuck(self);
-    log_line("mutex  ",
-             "COSW_Mutex held >45s -- treating as dead and proceeding without it",
-             "");
+    log_line("mutex  ", "proceeding without the dead COSW_Mutex", "");
     return 0;
 }
 
