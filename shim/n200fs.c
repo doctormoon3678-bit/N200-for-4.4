@@ -616,7 +616,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v14-config\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v15-survive\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -2341,6 +2341,138 @@ int _ZN8COilInfo10GetOilInfoEP19CNavisSQLAccessInfoiiiiiRSt6vectorINS_8Oil_InfoE
                  "COilInfo::GetOilInfo -> 0 (oil-price subsystem disabled)", "");
     }
     return 0;
+}
+
+/* --- survive the intermittent garbage-jump crash --------------------------
+ * A background thread occasionally jumps through a corrupt function pointer to
+ * 0x40f100b5 (a fixed, unmapped address) and takes a SIGSEGV; CNS2K's global
+ * handler reports it and the process then dies. It is a race -- build A dodged
+ * it, build B hit it. The crashing thread is not essential, so catch the
+ * signal: when the faulting PC is not inside any executable mapping the thread
+ * is running garbage (which no legitimate fault can be -- ART's implicit null
+ * checks always fault from valid code), so log it and exit just that thread,
+ * leaving the rest of the app alive. Every other fault is passed to whatever
+ * handler was installed before this one (CNS2K's, and through it ART's), so
+ * Java null-checks and normal crash reporting are unchanged. */
+static int hexv(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+static unsigned g_xr_lo[256], g_xr_hi[256];
+static int g_xr_n;
+static void load_exec_ranges(void)
+{
+    char buf[8192], line[256];
+    int fd, n, i, li = 0, cnt = 0;
+    if (!r_open || !r_read) return;
+    fd = r_open("/proc/self/maps", 0, 0);
+    if (fd < 0) return;
+    while ((n = r_read(fd, buf, sizeof buf)) > 0) {
+        for (i = 0; i < n; i++) {
+            char c = buf[i];
+            if (c != '\n') { if (li < (int)sizeof line - 1) line[li++] = c; continue; }
+            line[li] = 0; li = 0;
+            {
+                unsigned lo = 0, hi = 0; int j = 0, ex = 0, k;
+                for (; line[j] && line[j] != '-'; j++) lo = lo * 16u + (unsigned)hexv(line[j]);
+                if (line[j] == '-') j++;
+                for (; line[j] && line[j] != ' '; j++) hi = hi * 16u + (unsigned)hexv(line[j]);
+                if (line[j] == ' ')
+                    for (k = j + 1; k < j + 5 && line[k]; k++) if (line[k] == 'x') ex = 1;
+                if (ex && cnt < 256) { g_xr_lo[cnt] = lo; g_xr_hi[cnt] = hi; cnt++; }
+            }
+        }
+    }
+    if (r_close) r_close(fd);
+    g_xr_n = cnt;
+}
+static int pc_executable(unsigned pc)
+{
+    int i;
+    for (i = 0; i < g_xr_n; i++) if (pc >= g_xr_lo[i] && pc < g_xr_hi[i]) return 1;
+    return 0;
+}
+
+static void (*g_prev_segv)(int, void *, void *);
+static int   g_prev_flags;
+static void  (*r_pthread_exit)(void *);
+
+static void n200_crash(int sig, void *si, void *uc)
+{
+    unsigned pc = 0, lr = 0, fa = 0;
+    if (uc) {
+        const char *u = (const char *)uc;
+        pc = *(const unsigned *)(u + 92);     /* ucontext -> arm_pc          */
+        lr = *(const unsigned *)(u + 88);     /* arm_lr                      */
+        fa = *(const unsigned *)(u + 100);    /* fault_address               */
+    }
+    if (pc && !pc_executable(pc)) {
+        load_exec_ranges();                   /* a lib may have mapped since */
+        if (!pc_executable(pc)) {
+            char b[96]; int n = 0;
+            s_cat(b, sizeof b, &n, "garbage-jump pc=");
+            put_hex(b, &n, sizeof b, pc);
+            s_cat(b, sizeof b, &n, " lr=");
+            put_hex(b, &n, sizeof b, lr);
+            s_cat(b, sizeof b, &n, " fault=");
+            put_hex(b, &n, sizeof b, fa);
+            log_line("crash  ", b, " -- killing this thread only; app survives");
+            if (!r_pthread_exit && g_libc)
+                r_pthread_exit = (void (*)(void *))dlsym(g_libc, "pthread_exit");
+            if (r_pthread_exit) r_pthread_exit(0);   /* does not return */
+        }
+    }
+    if (g_prev_segv) {
+        if (g_prev_flags & 4) g_prev_segv(sig, si, uc);          /* SA_SIGINFO */
+        else ((void (*)(int))(void *)g_prev_segv)(sig);
+    }
+}
+
+#define N200_SIGBUS  7
+#define N200_SIGSEGV 11
+#define N200_SA_SIGINFO 4
+int sigaction(int sig, const void *act, void *old);
+int sigaction(int sig, const void *act, void *old)
+{
+    static int (*real)(int, const void *, void *);
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        if (g_libc) real = (int (*)(int, const void *, void *))
+                           dlsym(g_libc, "sigaction");
+    }
+    if (!real) return -1;
+    if ((sig == N200_SIGSEGV || sig == N200_SIGBUS) && act) {
+        void *h = *(void * const *)((const char *)act);
+        int flags = *(const int *)((const char *)act + 8);
+        char myact[16], prevact[16];
+        void *realprev; int realprevfl, rc, i;
+        if (h == (void *)n200_crash) return real(sig, act, old);   /* ours already */
+        for (i = 0; i < 16; i++) myact[i] = ((const char *)act)[i];
+        *(void **)(myact) = (void *)n200_crash;
+        *(int *)(myact + 8) = flags | N200_SA_SIGINFO;
+        if (!g_xr_n) load_exec_ranges();
+        rc = real(sig, myact, prevact);
+        /* Hand the caller the handler that was really there before, not ours,
+         * so its own chaining still reaches it; remember the new one to chain
+         * to on a fault. */
+        if (*(void **)(prevact) == (void *)n200_crash) {
+            realprev = (void *)g_prev_segv; realprevfl = g_prev_flags;
+        } else {
+            realprev = *(void **)(prevact); realprevfl = *(int *)(prevact + 8);
+        }
+        g_prev_segv = (void (*)(int, void *, void *))h; g_prev_flags = flags;
+        if (old) {
+            for (i = 0; i < 16; i++) ((char *)old)[i] = prevact[i];
+            *(void **)(old) = realprev;
+            *(int *)((char *)old + 8) = realprevfl;
+        }
+        return rc;
+    }
+    return real(sig, act, old);
 }
 
 /* --- watchdog: name the exact syscall map_initialize's thread is stuck in ---

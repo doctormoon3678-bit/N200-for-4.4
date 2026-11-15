@@ -60,7 +60,7 @@ cat > "$WORK/export.map" <<'EOF'
   global:
     fopen; open; stat; access; opendir;
     mkdir; rmdir; unlink; remove; rename;
-    utimes; statfs; system; strcasecmp; fcntl; pthread_mutex_init;
+    utimes; statfs; system; strcasecmp; fcntl; pthread_mutex_init; sigaction;
     n200fs_note;
     _Z16zh_basefile_initPvPii;
     _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo;
@@ -153,6 +153,7 @@ pthread_mutex_init
 remove
 rename
 rmdir
+sigaction
 stat
 statfs
 strcasecmp
