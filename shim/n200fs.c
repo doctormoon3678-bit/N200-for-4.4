@@ -1371,6 +1371,17 @@ static void put_u(char *b, int *n, int cap, unsigned v, int digits)
     b[*n] = 0;
 }
 
+static void put_hex(char *b, int *n, int cap, unsigned v)
+{
+    static const char H[] = "0123456789abcdef";
+    int i;
+    for (i = 28; i >= 0; i -= 4) {
+        if (*n + 1 >= cap) return;
+        b[(*n)++] = H[(v >> i) & 0xf];
+    }
+    b[*n] = 0;
+}
+
 /* 37566500 -> "3733.9900" : degrees, then minutes to four decimals. */
 static void put_coord(char *b, int *n, int cap, int udeg, int degdigits)
 {
@@ -2218,6 +2229,72 @@ static void dump_all_threads(const char *when)
     if (r_closedir) r_closedir(dir);
 }
 
+/* Parse the stack pointer (second-to-last hex token) out of .../syscall. */
+static unsigned wd_sp(int tid)
+{
+    char path[128], buf[256];
+    int fd, n, pn = 0, i;
+    unsigned vals[12], nv = 0;
+    s_cat(path, sizeof path, &pn, "/proc/self/task/");
+    put_u(path, &pn, sizeof path, (unsigned)tid, 0);
+    s_cat(path, sizeof path, &pn, "/syscall");
+    fd = r_open ? r_open(path, 0, 0) : -1;
+    if (fd < 0) return 0;
+    n = r_read ? r_read(fd, buf, sizeof buf - 1) : 0;
+    if (r_close) r_close(fd);
+    if (n <= 0) return 0;
+    buf[n] = 0;
+    for (i = 0; buf[i] && nv < 12; i++) {
+        if (buf[i] == '0' && buf[i + 1] == 'x') {
+            unsigned v = 0;
+            int j = i + 2;
+            for (;;) {
+                char c = buf[j];
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else break;
+                v = v * 16u + (unsigned)d; j++;
+            }
+            vals[nv++] = v;
+            i = j - 1;
+        }
+    }
+    return nv >= 2 ? vals[nv - 2] : 0;   /* ... args, SP, PC */
+}
+
+/* Scan the blocked thread's stack for words that look like return addresses
+ * into a loaded library, giving a best-effort native backtrace. The stack is
+ * this process's own memory, so it is read directly; scanning UP from SP stays
+ * inside the already-used part of the stack. Addresses are resolved to
+ * lib+offset by hand against the /proc/self/maps snapshot in the same log. */
+static void dump_stack(int tid)
+{
+    unsigned sp = wd_sp(tid), i, v;
+    const volatile unsigned *p;
+    int logged = 0;
+    char line[48];
+    int n;
+    if (sp < 0x90000000u || sp >= 0xb0000000u) {
+        log_line("wd ", "stack pointer out of expected range", "");
+        return;
+    }
+    log_line("wd ---- native backtrace of MV_Main (stack scan) ----", "", "");
+    p = (const volatile unsigned *)sp;
+    for (i = 0; i < 4096 && logged < 90; i++) {
+        v = p[i];
+        if (v >= 0xa0000000u && v < 0xb7000000u) {   /* a loaded-library text addr */
+            n = 0;
+            s_cat(line, sizeof line, &n, "wd bt +");
+            put_u(line, &n, sizeof line, i * 4u, 0);
+            s_cat(line, sizeof line, &n, " ");
+            put_hex(line, &n, sizeof line, v);
+            log_line(line, "", "");
+            logged++;
+        }
+    }
+}
+
 static void *ml_watchdog(void *arg)
 {
     (void)arg;
@@ -2229,6 +2306,7 @@ static void *ml_watchdog(void *arg)
         wd_read("wchan", g_ml_tid, "t12");
         wd_read("syscall", g_ml_tid, "t12");
         wd_read("stat", g_ml_tid, "t12");
+        dump_stack(g_ml_tid);
         log_line("wd ---- all threads ----", "", "");
         dump_all_threads("all");
     }
