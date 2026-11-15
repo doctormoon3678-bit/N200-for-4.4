@@ -609,7 +609,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v10-maps\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v11-oil\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -2245,6 +2245,32 @@ int _ZN10COSW_Mutex4LockEv(void *self)
     log_line("mutex  ",
              "COSW_Mutex held >3s by a gone thread -- proceeding without it",
              "");
+    return 0;
+}
+
+/* --- neutralise the oil-price (gas-station) subsystem ----------------------
+ * Once the DB deadlock was gone the app ran far enough to start CMVOilPrice's
+ * thread, which crashed: it reads fuel-price records with COilInfo::GetOilInfo
+ * and then processes them, but this card's OIL data is incomplete (its index
+ * OIL_INFO_NDS.nal is missing), so the records come back malformed and the
+ * processing smashes its own stack -- the device log shows the fault address
+ * landing inside a thread stack right after "CMVOilPrice insert Cache". Fuel
+ * prices are not needed to draw the map, so answer "no records" (return 0,
+ * leave the caller's already-empty vector untouched) and the thread skips the
+ * whole path. GetOilInfo is defined in libHNcommonlib and imported by
+ * libNV_MD, so the call lands here. */
+int _ZN8COilInfo10GetOilInfoEP19CNavisSQLAccessInfoiiiiiRSt6vectorINS_8Oil_InfoESaIS3_EE(
+        void *self, void *info, int a, int b, int c, int d, int e, void *out);
+int _ZN8COilInfo10GetOilInfoEP19CNavisSQLAccessInfoiiiiiRSt6vectorINS_8Oil_InfoESaIS3_EE(
+        void *self, void *info, int a, int b, int c, int d, int e, void *out)
+{
+    static int logged;
+    (void)self; (void)info; (void)a; (void)b; (void)c; (void)d; (void)e; (void)out;
+    if (!logged) {
+        logged = 1;
+        log_line("oil    ",
+                 "COilInfo::GetOilInfo -> 0 (oil-price subsystem disabled)", "");
+    }
     return 0;
 }
 

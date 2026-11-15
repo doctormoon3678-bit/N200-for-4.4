@@ -66,6 +66,7 @@ cat > "$WORK/export.map" <<'EOF'
     _Z18zh_maplist_db_openPcPP19CNavisSQLAccessInfoPP17CNavisSQLStmtInfo;
     _Z18zh_vertexfile_initPvPii;
     _ZN10COSW_Mutex4LockEv;
+    _ZN8COilInfo10GetOilInfoEP19CNavisSQLAccessInfoiiiiiRSt6vectorINS_8Oil_InfoESaIS3_EE;
     __android_log_print;
     _Z22NaviGetNaviSDCardStatev;
     _Z22mdGetFirstLayerOnStatev;
@@ -137,6 +138,7 @@ _ZN10COSW_Mutex4LockEv
 _ZN14NVDebugMessage8traceErrEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceMsgEiPKcS1_S1_z
 _ZN14NVDebugMessage8traceWarEiPKcS1_S1_z
+_ZN8COilInfo10GetOilInfoEP19CNavisSQLAccessInfoiiiiiRSt6vectorINS_8Oil_InfoESaIS3_EE
 __android_log_print
 access
 fcntl
