@@ -598,6 +598,8 @@ static void pick_roots(void)
  * a file manager open as to have adb on a desktop, and when the card is not
  * found the mount list is the one thing needed to say why.
  */
+static int dump_maps(unsigned tag);   /* defined later; used to seed one early snapshot */
+
 static void write_log(void)
 {
     char path[PATHMAX], out[2048];
@@ -607,7 +609,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v9-UNLOCK\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v10-maps\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
@@ -681,6 +683,11 @@ static void write_log(void)
     if (fd < 0) return;
     r_write(fd, out, (u32)n);
     if (r_close) r_close(fd);
+
+    /* One guaranteed /proc/self/maps snapshot right after the banner, so even a
+     * crash before the engine logs enough to trigger the periodic snapshots
+     * still has a module map to resolve its frames against. */
+    dump_maps(0);
 }
 
 static void resolve(void)
@@ -1687,17 +1694,17 @@ static long now_s(void)
  * own logging call and throttled, so a fresh snapshot always exists shortly
  * before any crash. Read and write go straight through the raw libc pointers,
  * never back through __android_log_print, so there is no recursion. */
-static void dump_maps(unsigned tag)
+static int dump_maps(unsigned tag)
 {
     char p[PATHMAX], buf[4096], h[48];
     int mfd, lfd, n, hn = 0;
-    if (!r_open || !r_read || !r_write || !g_write[0]) return;
-    if (!join(p, sizeof p, g_write, "n200fs.log")) return;
+    if (!r_open || !r_read || !r_write || !g_write[0]) return 0;
+    if (!join(p, sizeof p, g_write, "n200fs.log")) return 0;
+    mfd = r_open("/proc/self/maps", 0 /* O_RDONLY */, 0);
+    if (mfd < 0) return 0;
     s_cat(h, sizeof h, &hn, "==== maps #");
     put_u(h, &hn, sizeof h, tag, 0);
     log_line(h, " ====", "");
-    mfd = r_open("/proc/self/maps", 0 /* O_RDONLY */, 0);
-    if (mfd < 0) { log_line("maps: cannot open /proc/self/maps", "", ""); return; }
     lfd = r_open(p, 1 | 0100 | 02000 /* O_WRONLY|O_CREAT|O_APPEND */, 0644);
     if (lfd >= 0) {
         while ((n = r_read(mfd, buf, sizeof buf)) > 0)
@@ -1706,6 +1713,7 @@ static void dump_maps(unsigned tag)
     }
     if (r_close) r_close(mfd);
     log_line("==== end maps ====", "", "");
+    return 1;
 }
 
 static void maybe_dump_maps(void)
@@ -1715,11 +1723,12 @@ static void maybe_dump_maps(void)
     long t;
     if (count >= 10) return;
     t = now_s();
-    /* The first few snapshots go out back-to-back, not 3s apart, so that even
-     * a crash in the first second or two still has a /proc/self/maps to be
-     * resolved against. After that, one every few seconds. */
-    if (count < 4) { last = t; dump_maps((unsigned)count++); return; }
-    if (t - last >= 3) { last = t; dump_maps((unsigned)count++); }
+    /* Only a snapshot that actually wrote counts: early calls, before the write
+     * root is resolved, must not burn the budget, or a crash in the first
+     * second or two ends up with no /proc/self/maps to resolve against. The
+     * first few real snapshots go out back-to-back, then one every few seconds. */
+    if (count < 4) { if (dump_maps((unsigned)count)) { count++; last = t; } return; }
+    if (t - last >= 3) { if (dump_maps((unsigned)count)) { count++; last = t; } }
 }
 
 static int gate_real(struct gate *g, int (*self)(void))
