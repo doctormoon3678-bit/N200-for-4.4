@@ -121,6 +121,13 @@ static void *(*r_fdopen)(int, const char *);
 struct root { const char *p; int need_nk; };
 static const struct root ROOTS[] = {
     { "/mnt/extSdCard",   0 },
+    /* The HMI stores the DB_HMI config root without a leading slash, so it asks
+     * for "mnt/extSdCard///Navkingdom/Navi/DB_HMI/ND_ConfigurationFile.xml" --
+     * a relative path that silently fails to open, leaving the whole rendering
+     * config (shader path, fonts, DM files) as null pointers that the renderer
+     * then crashes on. Recognise that form too and redirect it like the real
+     * root. need_nk keeps it from swallowing unrelated relative paths. */
+    { "mnt/extSdCard",    1 },
     { "/storage/sdcard0", 1 },
     { "/storage/sdcard1", 1 },
     { "/Storage Card2",   0 },
@@ -609,7 +616,7 @@ static void write_log(void)
     if (!join(path, sizeof path, g_write, "n200fs.log")) return;
 
     out[0] = 0;
-    s_cat(out, sizeof out, &n, "n200fs  BUILD=v13-holder\nredirecting ");
+    s_cat(out, sizeof out, &n, "n200fs  BUILD=v14-config\nredirecting ");
     s_cat(out, sizeof out, &n, PFX);
     s_cat(out, sizeof out, &n, "\n  reads  -> ");
     s_cat(out, sizeof out, &n, g_data);
